@@ -20,7 +20,7 @@ swapped for the real APIs.
 
 ## Features
 - Email/password auth with two roles: **Customer** and **Provider**
-- Browse / search services across the 9 proposed categories
+- Browse / search services across categories (printing, gas refill, repairs, rentals, secondhand & more) — providers can create new categories when what they offer isn't listed
 - Place orders with delivery location, courier option, and payment method
 - Full order lifecycle: requested → accepted → in progress → out for delivery → delivered → completed (+ cancel)
 - Customer order tracking with status timeline
@@ -45,7 +45,7 @@ Then open **http://localhost:5173**.
 | Role | Email |
 |------|-------|
 | Customer | `student@knust.edu.gh` |
-| Provider | `kwame@knust.edu.gh` (also `adjoa@`, `yaw@`) |
+| Provider | `kwame@knust.edu.gh` (also `adjoa@`, `yaw@`, `kojo@`, `esi@`) |
 
 Or register a new account from the Sign up page.
 
