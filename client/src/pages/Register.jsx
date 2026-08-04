@@ -24,7 +24,7 @@ export default function Register() {
     setBusy(true);
     try {
       const user = await register(form);
-      navigate(user.role === "provider" ? "/dashboard" : "/");
+      navigate(user.role === "provider" ? "/dashboard" : "/services");
     } catch (err) {
       setError(err.message);
     } finally {
@@ -38,7 +38,7 @@ export default function Register() {
         <h1 style={{ marginTop: 0 }}>Create your account</h1>
         {error && <div className="error">{error}</div>}
         <form onSubmit={submit}>
-          <label>I want to…</label>
+          <label>Create account as</label>
           <select value={form.role} onChange={set("role")}>
             <option value="customer">Book services (Customer)</option>
             <option value="provider">Offer services (Provider)</option>

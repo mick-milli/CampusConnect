@@ -1,12 +1,14 @@
-// Fallback icons (the API also returns icons, but these keep the UI lively offline).
+// Fallback icons for the seeded categories (the API also returns icons —
+// provider-created categories rely on those, with ✨ as the default).
 export const CATEGORY_ICONS = {
-  academic: "📚",
+  printing: "🖨️",
+  gas: "🔥",
+  repairs: "🛠️",
+  rentals: "🧰",
+  secondhand: "♻️",
   tech: "💻",
-  errand: "🛵",
-  hostel: "🧹",
   creative: "📸",
   courier: "📦",
-  utility: "🔌",
   event: "🎉",
   beauty: "💇",
 };

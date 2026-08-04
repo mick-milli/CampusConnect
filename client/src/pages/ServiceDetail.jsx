@@ -2,13 +2,15 @@ import { useEffect, useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { api } from "../api.js";
 import { useAuth } from "../auth.jsx";
-import { cedis, CategoryIcon, Spinner } from "../components/common.jsx";
+import { cedis, CategoryIcon, Spinner, Stars, RatingSummary, timeAgo, Avatar } from "../components/common.jsx";
+import ImageCarousel from "../components/ImageCarousel.jsx";
 
 export default function ServiceDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
   const [service, setService] = useState(null);
+  const [reviews, setReviews] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -17,7 +19,7 @@ export default function ServiceDetail() {
     note: "",
     deliveryLocation: "",
     courier: true,
-    payment: "cash",
+    payment: "momo",
   });
 
   useEffect(() => {
@@ -29,6 +31,10 @@ export default function ServiceDetail() {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
+    api
+      .get(`/services/${id}/reviews`)
+      .then(setReviews)
+      .catch(() => setReviews([]));
   }, [id, user]);
 
   const placeOrder = async (e) => {
@@ -50,32 +56,58 @@ export default function ServiceDetail() {
 
   return (
     <div style={{ margin: "26px 0" }}>
-      <Link className="muted" to="/">
+      <button
+        className="linkish-plain muted"
+        onClick={() =>
+          window.history.state?.idx > 0 ? navigate(-1) : navigate("/services")
+        }
+      >
         ← Back to services
-      </Link>
+      </button>
 
       <div className="grid cols-2" style={{ marginTop: 16, alignItems: "start" }}>
         <div className="card" style={{ padding: 24 }}>
-          <div className="cat" style={{ color: "var(--green)", fontWeight: 700 }}>
-            <CategoryIcon id={service.categoryId} /> {service.category?.name}
+          <ImageCarousel
+            media={
+              service.media?.length
+                ? service.media
+                : [{ url: `/images/categories/${service.categoryId}.jpg`, type: "image" }]
+            }
+            alt={service.title}
+            height={240}
+          />
+          <div className="cat" style={{ color: "var(--green)", fontWeight: 700, marginTop: 14 }}>
+            <CategoryIcon id={service.categoryId} icon={service.category?.icon} />{" "}
+            {service.category?.name}
           </div>
           <h1 style={{ margin: "8px 0" }}>{service.title}</h1>
+          <div style={{ margin: "2px 0 8px" }}>
+            <RatingSummary avg={service.ratingAvg} count={service.ratingCount} size={15} />
+          </div>
           <p className="muted">{service.description}</p>
           <hr style={{ border: "none", borderTop: "1px solid var(--line)", margin: "16px 0" }} />
           <div className="row spread">
-            <div>
-              <div className="muted" style={{ fontSize: 13 }}>
-                Service provider
-              </div>
-              <strong>{service.provider?.name}</strong>
-              <div className="muted" style={{ fontSize: 13 }}>
-                📍 {service.provider?.location || "KNUST campus"}
+            <div className="order-party">
+              <Avatar user={service.provider} size={44} />
+              <div style={{ minWidth: 0 }}>
+                <div className="muted" style={{ fontSize: 13 }}>
+                  Service provider
+                </div>
+                <strong>{service.provider?.name}</strong>
+                <div className="muted" style={{ fontSize: 13 }}>
+                  📍 {service.provider?.location || "KNUST campus"}
+                </div>
               </div>
             </div>
             <div className="price" style={{ fontSize: 22 }}>
               {cedis(service.price)}
             </div>
           </div>
+          {service.provider?.bio && (
+            <p className="muted" style={{ fontSize: 14, marginTop: 10 }}>
+              “{service.provider.bio}”
+            </p>
+          )}
         </div>
 
         <form className="card" style={{ padding: 24 }} onSubmit={placeOrder}>
@@ -122,9 +154,13 @@ export default function ServiceDetail() {
                 value={form.payment}
                 onChange={(e) => setForm({ ...form, payment: e.target.value })}
               >
-                <option value="cash">Cash on delivery</option>
-                <option value="momo">Mobile Money (mock — instant)</option>
+                <option value="momo">Mobile Money</option>
+                <option value="card">Debit / Credit card</option>
               </select>
+              <p className="muted" style={{ fontSize: 13, marginTop: 8 }}>
+                🔒 You'll pay after the provider accepts. Funds are held in
+                escrow and released to them only once you confirm the work is done.
+              </p>
 
               <button className="btn" style={{ width: "100%", marginTop: 18 }} disabled={submitting}>
                 {submitting ? "Placing order…" : `Place order · ${cedis(service.price)}`}
@@ -132,6 +168,33 @@ export default function ServiceDetail() {
             </>
           )}
         </form>
+      </div>
+
+      <div className="card" style={{ padding: 24, marginTop: 20 }}>
+        <div className="spread">
+          <h2 style={{ margin: 0 }}>Reviews</h2>
+          <RatingSummary avg={service.ratingAvg} count={service.ratingCount} size={16} />
+        </div>
+        {reviews.length === 0 ? (
+          <p className="muted" style={{ marginTop: 12 }}>
+            No reviews yet. Order this service and you can be the first to review it.
+          </p>
+        ) : (
+          <ul className="review-list">
+            {reviews.map((r) => (
+              <li key={r.id} className="review">
+                <div className="spread">
+                  <strong>{r.authorName}</strong>
+                  <Stars value={r.rating} />
+                </div>
+                {r.comment && <p style={{ margin: "6px 0 0" }}>{r.comment}</p>}
+                <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                  {timeAgo(r.createdAt)}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );

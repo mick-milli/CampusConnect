@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api.js";
 import { useAuth } from "../auth.jsx";
-import { cedis, StatusTag, STATUS_LABELS, Spinner } from "../components/common.jsx";
+import { cedis, StatusTag, STATUS_LABELS, Spinner, Stars, Avatar } from "../components/common.jsx";
+import OrderChat from "../components/OrderChat.jsx";
 
 // What the provider can advance an order to next.
 const PROVIDER_NEXT = {
@@ -15,8 +16,247 @@ const PROVIDER_NEXT = {
   cancelled: [],
 };
 
-function OrderCard({ order, role, onUpdate }) {
+const METHOD_LABEL = { cash: "Cash", momo: "Mobile Money", card: "Card" };
+const PAY_BADGE = {
+  unpaid: { label: "Unpaid", cls: "pay-unpaid" },
+  in_escrow: { label: "In escrow", cls: "pay-escrow" },
+  released: { label: "Released", cls: "pay-released" },
+  refunded: { label: "Refunded", cls: "pay-refunded" },
+};
+// A customer can fund the escrow once the provider has accepted (up to delivery).
+const PAYABLE_STATUSES = ["accepted", "in_progress", "out_for_delivery", "delivered"];
+// Work steps a provider can't reach until an online order's escrow is funded.
+const WORK_STEPS = ["in_progress", "out_for_delivery", "delivered"];
+const isOnline = (pay) => pay?.method === "momo" || pay?.method === "card";
+
+// Pay entry point. With Paystack live, the customer picks a method and is sent
+// to Paystack's secure checkout (card/MoMo details are entered there). Without
+// keys configured, the same button simulates the charge for local dev.
+function PayForm({ order, onUpdate, paystackEnabled }) {
+  const pay = order.payment || {};
+  const [method, setMethod] = useState(pay.method === "card" ? "card" : "momo");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      const res = await api.post(`/orders/${order.id}/pay/init`, { method });
+      if (res.mode === "paystack") {
+        // Hand off to Paystack's secure checkout; it redirects back to /orders,
+        // where the payment is verified.
+        window.location.href = res.authorizationUrl;
+        return; // navigating away — keep the button disabled
+      }
+      onUpdate(res.order); // simulated (dev fallback)
+    } catch (err) {
+      setError(err.message);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="pay-form" onSubmit={submit}>
+      <div className="pay-methods">
+        {["momo", "card"].map((m) => (
+          <button
+            type="button"
+            key={m}
+            className={`pay-method ${method === m ? "on" : ""}`}
+            onClick={() => setMethod(m)}
+          >
+            {m === "momo" ? "📱 Mobile Money" : "💳 Card"}
+          </button>
+        ))}
+      </div>
+
+      {error && <div className="error">{error}</div>}
+      <button className="btn sm" disabled={busy} style={{ marginTop: 4 }}>
+        {busy
+          ? paystackEnabled
+            ? "Redirecting to Paystack…"
+            : "Securing payment…"
+          : `Pay ${cedis(pay.amount)} into escrow`}
+      </button>
+      <p className="muted" style={{ fontSize: 12, margin: "6px 0 0" }}>
+        🔒 Held safely — released to the provider only when you confirm the work is done.{" "}
+        {paystackEnabled
+          ? "You'll complete payment securely on Paystack."
+          : "Demo: this is a simulated charge, no real money moves."}
+      </p>
+    </form>
+  );
+}
+
+const PAYOUT_VIEW = {
+  paid: { icon: "💸", text: "Paid out to you" },
+  pending: { icon: "💸", text: "Payout processing…" },
+  otp_required: { icon: "💸", text: "Payout pending approval" },
+  awaiting_details: { icon: "⚠️", text: "Add your payout details to get paid" },
+  failed: { icon: "⚠️", text: "Payout failed — check your details" },
+};
+
+// Provider-only payout status shown once an order's escrow is released.
+function ProviderPayout({ order, onUpdate }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const payout = order.payout || { status: "pending" };
+  const view = PAYOUT_VIEW[payout.status] || PAYOUT_VIEW.pending;
+  const canRetry = ["awaiting_details", "failed"].includes(payout.status);
+
+  const retry = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await api.post(`/orders/${order.id}/payout/retry`);
+      onUpdate(updated);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      <p className="pay-note muted">
+        {view.icon} {view.text}
+        {payout.status === "paid" ? ` — ${cedis(order.payment?.amount)}` : ""}
+      </p>
+      {canRetry && (
+        <div className="row" style={{ marginTop: 6 }}>
+          <Link className="btn sm ghost" to="/settings/payout">
+            Payout details
+          </Link>
+          <button className="btn sm" disabled={busy} onClick={retry}>
+            {busy ? "Sending…" : "Retry payout"}
+          </button>
+        </div>
+      )}
+      {error && <div className="error">{error}</div>}
+    </div>
+  );
+}
+
+// Escrow status + (for the customer) the pay entry point. Cash orders skip this.
+function PaymentSection({ order, role, onUpdate, paystackEnabled }) {
+  const pay = order.payment || {};
+  if (!isOnline(pay)) return null;
+
+  const badge = PAY_BADGE[pay.status] || PAY_BADGE.unpaid;
+  const canPay =
+    role === "customer" && pay.status === "unpaid" && PAYABLE_STATUSES.includes(order.status);
+
+  return (
+    <div className="pay-section">
+      <div className="pay-status-line">
+        <span className="muted" style={{ fontSize: 13 }}>🔒 Escrow</span>
+        <span className={`pay-badge ${badge.cls}`}>{badge.label}</span>
+      </div>
+
+      {canPay && <PayForm order={order} onUpdate={onUpdate} paystackEnabled={paystackEnabled} />}
+
+      {role === "customer" && pay.status === "unpaid" && order.status === "requested" && (
+        <p className="pay-note muted">Payment opens once the provider accepts your order.</p>
+      )}
+      {role === "provider" && pay.status === "unpaid" && (
+        <p className="pay-note muted">⏳ Waiting for the customer to fund escrow before work begins.</p>
+      )}
+      {pay.status === "in_escrow" && (
+        <p className="pay-note muted">
+          {role === "provider"
+            ? `✅ ${cedis(pay.amount)} secured in escrow — safe to start. You receive it when the customer confirms completion.`
+            : `✅ ${cedis(pay.amount)} held in escrow. Released to the provider when you confirm the work is done.`}
+        </p>
+      )}
+      {pay.status === "released" &&
+        (role === "provider" ? (
+          <ProviderPayout order={order} onUpdate={onUpdate} />
+        ) : (
+          <p className="pay-note muted">Payment released to the provider. Thanks!</p>
+        ))}
+      {pay.status === "refunded" && (
+        <p className="pay-note muted">{cedis(pay.amount)} was refunded to the customer.</p>
+      )}
+    </div>
+  );
+}
+
+// Interactive star picker + comment for reviewing a completed order.
+function ReviewForm({ order, onReviewed }) {
+  const [rating, setRating] = useState(0);
+  const [hover, setHover] = useState(0);
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!rating) {
+      setError("Please pick a star rating.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const review = await api.post(`/orders/${order.id}/review`, { rating, comment });
+      onReviewed(order.id, review);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const shown = hover || rating;
+  return (
+    <form onSubmit={submit} style={{ marginTop: 12 }}>
+      <div className="muted" style={{ fontSize: 13 }}>
+        Rate this service
+      </div>
+      <div
+        className="star-input"
+        role="radiogroup"
+        aria-label="Star rating"
+        onMouseLeave={() => setHover(0)}
+      >
+        {[1, 2, 3, 4, 5].map((n) => (
+          <span
+            key={n}
+            role="radio"
+            aria-checked={rating === n}
+            aria-label={`${n} star${n > 1 ? "s" : ""}`}
+            tabIndex={0}
+            className={n <= shown ? "star on" : "star"}
+            onMouseEnter={() => setHover(n)}
+            onClick={() => setRating(n)}
+            onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && setRating(n)}
+          >
+            ★
+          </span>
+        ))}
+      </div>
+      <textarea
+        placeholder="Share a few words about your experience (optional)"
+        value={comment}
+        maxLength={500}
+        onChange={(e) => setComment(e.target.value)}
+        style={{ marginTop: 8 }}
+      />
+      {error && <div className="error">{error}</div>}
+      <button className="btn sm" disabled={busy} style={{ marginTop: 8 }}>
+        {busy ? "Submitting…" : "Submit review"}
+      </button>
+    </form>
+  );
+}
+
+function OrderCard({ order, role, me, onUpdate, onRemove, onReviewed, paystackEnabled }) {
+  const [busy, setBusy] = useState(false);
+  const other = role === "provider" ? order.customer : order.provider;
+  const otherName = other?.name;
 
   const update = async (status) => {
     setBusy(true);
@@ -30,22 +270,43 @@ function OrderCard({ order, role, onUpdate }) {
     }
   };
 
-  const nextSteps = role === "provider" ? PROVIDER_NEXT[order.status] || [] : [];
+  const remove = async () => {
+    if (!window.confirm("Delete this cancelled order? It's removed for both you and the other party."))
+      return;
+    setBusy(true);
+    try {
+      await api.del(`/orders/${order.id}`);
+      onRemove(order.id);
+    } catch (e) {
+      alert(e.message);
+      setBusy(false);
+    }
+  };
+
+  // Providers can accept/cancel freely, but can't start *work* on an online
+  // order until escrow is funded (payment happens after acceptance).
+  const escrowBlocked = role === "provider" && isOnline(order.payment) && order.payment?.status === "unpaid";
+  let nextSteps = role === "provider" ? PROVIDER_NEXT[order.status] || [] : [];
+  if (escrowBlocked) nextSteps = nextSteps.filter((s) => !WORK_STEPS.includes(s));
   const customerCanCancel = role === "customer" && ["requested", "accepted"].includes(order.status);
   const customerCanComplete = role === "customer" && order.status === "delivered";
 
   return (
     <div className="card" style={{ padding: 18 }}>
       <div className="spread">
-        <div>
+        <div style={{ minWidth: 0 }}>
           <Link to={`/services/${order.serviceId}`}>
             <strong>{order.service?.title || "Service"}</strong>
           </Link>
-          <div className="muted" style={{ fontSize: 13 }}>
-            {role === "provider"
-              ? `For ${order.customer?.name}`
-              : `by ${order.provider?.name}`}{" "}
-            · {new Date(order.createdAt).toLocaleString()}
+          <div className="order-party">
+            <Avatar user={other} size={34} />
+            <div style={{ minWidth: 0 }}>
+              <div className="muted" style={{ fontSize: 13 }}>
+                {role === "provider" ? "For" : "by"} <strong>{otherName}</strong> ·{" "}
+                {new Date(order.createdAt).toLocaleDateString()}
+              </div>
+              {other?.bio && <div className="party-bio muted">“{other.bio}”</div>}
+            </div>
           </div>
         </div>
         <StatusTag status={order.status} />
@@ -57,7 +318,7 @@ function OrderCard({ order, role, onUpdate }) {
           {order.courier ? "🛵 Courier delivery" : "🚶 Self pickup"}
         </span>
         <span className="muted">
-          💳 {order.payment?.method === "momo" ? "MoMo (paid)" : "Cash"}
+          💳 {METHOD_LABEL[order.payment?.method] || "Cash"}
         </span>
       </div>
 
@@ -83,6 +344,13 @@ function OrderCard({ order, role, onUpdate }) {
         </ul>
       )}
 
+      <PaymentSection
+        order={order}
+        role={role}
+        onUpdate={onUpdate}
+        paystackEnabled={paystackEnabled}
+      />
+
       {(nextSteps.length > 0 || customerCanCancel || customerCanComplete) && (
         <div className="row" style={{ marginTop: 14 }}>
           {nextSteps.map((s) => (
@@ -107,6 +375,40 @@ function OrderCard({ order, role, onUpdate }) {
           )}
         </div>
       )}
+
+      {order.status === "cancelled" && (
+        <div className="row" style={{ marginTop: 14 }}>
+          <button className="btn sm danger" disabled={busy} onClick={remove}>
+            🗑 Delete order
+          </button>
+        </div>
+      )}
+
+      {!["completed", "cancelled"].includes(order.status) && (
+        <OrderChat
+          orderId={order.id}
+          me={me}
+          otherName={otherName}
+          unread={order.unread || 0}
+          onSeen={() => order.unread && onUpdate({ ...order, unread: 0 })}
+        />
+      )}
+
+      {role === "customer" && order.status === "completed" && (
+        order.review ? (
+          <div style={{ marginTop: 12 }}>
+            <span className="muted" style={{ fontSize: 13 }}>
+              Your review:
+            </span>{" "}
+            <Stars value={order.review.rating} />
+            {order.review.comment && (
+              <div style={{ fontSize: 14, marginTop: 4 }}>{order.review.comment}</div>
+            )}
+          </div>
+        ) : (
+          <ReviewForm order={order} onReviewed={onReviewed} />
+        )
+      )}
     </div>
   );
 }
@@ -115,22 +417,54 @@ export default function Orders() {
   const { user } = useAuth();
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [paystackEnabled, setPaystackEnabled] = useState(false);
+  const [payMsg, setPayMsg] = useState("");
 
   useEffect(() => {
     api
       .get("/orders")
       .then(setOrders)
       .finally(() => setLoading(false));
+    api.get("/config").then((c) => setPaystackEnabled(!!c.paystackEnabled)).catch(() => {});
+    // Refresh in the background so status changes and unread badges show up.
+    const t = setInterval(() => api.get("/orders").then(setOrders).catch(() => {}), 15000);
+    return () => clearInterval(t);
   }, []);
 
   const onUpdate = (updated) =>
     setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
+
+  const onRemove = (id) => setOrders((prev) => prev.filter((o) => o.id !== id));
+
+  const onReviewed = (orderId, review) =>
+    setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, review } : o)));
+
+  // Returning from Paystack's checkout — verify the payment by its reference,
+  // then strip the query so a refresh doesn't re-trigger it.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const reference = params.get("reference") || params.get("trxref");
+    if (!reference) return;
+    window.history.replaceState({}, "", window.location.pathname);
+    api
+      .post("/pay/verify", { reference })
+      .then((updated) => {
+        onUpdate(updated);
+        setPayMsg("✅ Payment received — your money is held safely in escrow.");
+      })
+      .catch((e) => setPayMsg(`⚠️ ${e.message}`));
+  }, []);
 
   if (loading) return <Spinner />;
 
   return (
     <div style={{ margin: "26px 0" }}>
       <h1>{user.role === "provider" ? "Incoming Orders" : "My Orders"}</h1>
+      {payMsg && (
+        <div className={payMsg.startsWith("⚠️") ? "error" : "success"} style={{ marginBottom: 14 }}>
+          {payMsg}
+        </div>
+      )}
       {orders.length === 0 ? (
         <div className="empty">
           No orders yet.{" "}
@@ -143,7 +477,16 @@ export default function Orders() {
       ) : (
         <div className="grid" style={{ marginTop: 16 }}>
           {orders.map((o) => (
-            <OrderCard key={o.id} order={o} role={user.role} onUpdate={onUpdate} />
+            <OrderCard
+              key={o.id}
+              order={o}
+              role={user.role}
+              me={user.id}
+              onUpdate={onUpdate}
+              onRemove={onRemove}
+              onReviewed={onReviewed}
+              paystackEnabled={paystackEnabled}
+            />
           ))}
         </div>
       )}

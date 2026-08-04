@@ -1,86 +1,76 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api.js";
-import ServiceCard from "../components/ServiceCard.jsx";
+import { useAuth } from "../auth.jsx";
 import { Spinner } from "../components/common.jsx";
 
+// Customer browse page: mirrors the landing page's category tiles (photo,
+// name, short description — no prices). Services only appear after clicking
+// into a category.
 export default function Home() {
+  const { user } = useAuth();
   const [categories, setCategories] = useState([]);
-  const [services, setServices] = useState([]);
-  const [active, setActive] = useState("");
   const [q, setQ] = useState("");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api.get("/categories").then(setCategories).catch(() => {});
+    api
+      .get("/categories")
+      .then(setCategories)
+      .finally(() => setLoading(false));
   }, []);
 
-  useEffect(() => {
-    setLoading(true);
-    const params = new URLSearchParams();
-    if (active) params.set("category", active);
-    if (q) params.set("q", q);
-    const qs = params.toString();
-    api
-      .get(`/services${qs ? `?${qs}` : ""}`)
-      .then(setServices)
-      .finally(() => setLoading(false));
-  }, [active, q]);
+  const needle = q.trim().toLowerCase();
+  const shown = needle
+    ? categories.filter(
+        (c) =>
+          c.name.toLowerCase().includes(needle) ||
+          (c.description || "").toLowerCase().includes(needle)
+      )
+    : categories;
 
   return (
     <>
-      <section className="hero">
-        <span className="badge">🎓 Built for KNUST campus</span>
-        <h1>Campus services, delivered to your door.</h1>
-        <p>
-          Printing, food runs, repairs, tech help, photography and more — book any campus
-          service on-demand and have it couriered to your hall.
-        </p>
-        <a className="btn gold" href="#browse">
-          Browse services
-        </a>
+      <section className="hero compact">
+        <span className="badge">🎓 KNUST campus marketplace</span>
+        <h1>Welcome back{user ? `, ${user.name.split(" ")[0]}` : ""}.</h1>
+        <p>What do you need done today? Pick a category to see its services.</p>
       </section>
 
-      <div id="browse">
-        <div className="spread">
-          <h2 className="section-title" style={{ margin: 0 }}>
-            Explore services
-          </h2>
-          <input
-            style={{ maxWidth: 260 }}
-            placeholder="Search services…"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-          />
-        </div>
+      <div className="spread">
+        <h2 className="section-title" style={{ margin: 0 }}>
+          Explore categories
+        </h2>
+        <input
+          style={{ maxWidth: 260 }}
+          placeholder="Search categories…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+      </div>
 
-        <div className="chips" style={{ margin: "14px 0 22px" }}>
-          <button className={`chip ${!active ? "active" : ""}`} onClick={() => setActive("")}>
-            All
-          </button>
-          {categories.map((c) => (
-            <button
-              key={c.id}
-              className={`chip ${active === c.id ? "active" : ""}`}
-              onClick={() => setActive(c.id)}
-              title={c.description}
-            >
-              {c.icon} {c.name}
-            </button>
+      {loading ? (
+        <Spinner />
+      ) : shown.length === 0 ? (
+        <div className="empty">No categories match your search.</div>
+      ) : (
+        <div className="cat-grid" style={{ margin: "18px 0 30px" }}>
+          {shown.map((c) => (
+            <Link key={c.id} to={`/services/category/${c.id}`} className="card cat-tile">
+              <span className="cat-icon">{c.icon}</span>
+              <strong>{c.name}</strong>
+              <span className="muted">{c.description}</span>
+              <img
+                className="cat-photo"
+                src={`/images/categories/${c.id}.jpg`}
+                alt={c.name}
+                loading="lazy"
+                onError={(e) => (e.currentTarget.style.display = "none")}
+              />
+            </Link>
           ))}
         </div>
-
-        {loading ? (
-          <Spinner />
-        ) : services.length === 0 ? (
-          <div className="empty">No services found. Try a different category.</div>
-        ) : (
-          <div className="grid cols-3">
-            {services.map((s) => (
-              <ServiceCard key={s.id} service={s} />
-            ))}
-          </div>
-        )}
-      </div>
+      )}
     </>
   );
 }

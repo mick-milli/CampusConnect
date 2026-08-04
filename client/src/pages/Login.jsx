@@ -3,24 +3,47 @@ import { Link, useNavigate, useLocation } from "react-router-dom";
 import { useAuth } from "../auth.jsx";
 
 export default function Login() {
-  const { login } = useAuth();
+  const { login, completeMfa } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // Two-factor step: set once a password login reports mfaRequired.
+  const [factorId, setFactorId] = useState(null);
+  const [code, setCode] = useState("");
+
+  const goTo = (user) =>
+    navigate(location.state?.from || (user.role === "provider" ? "/dashboard" : "/services"));
 
   const submit = async (e) => {
     e.preventDefault();
     setError("");
     setBusy(true);
     try {
-      await login(email, password);
-      navigate(location.state?.from || "/");
+      const res = await login(email, password);
+      if (res.mfaRequired) {
+        setFactorId(res.factorId);
+        setBusy(false);
+        return;
+      }
+      goTo(res.user);
     } catch (err) {
       setError(err.message);
-    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitCode = async (e) => {
+    e.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      const user = await completeMfa(factorId, code.trim());
+      goTo(user);
+    } catch (err) {
+      setError(err.message);
       setBusy(false);
     }
   };
@@ -33,6 +56,44 @@ export default function Login() {
   return (
     <div className="center-narrow">
       <div className="card" style={{ padding: 28 }}>
+        {factorId ? (
+          <>
+            <h1 style={{ marginTop: 0 }}>Two-factor authentication</h1>
+            <p className="muted">
+              Enter the 6-digit code from your authenticator app to finish signing in.
+            </p>
+            {error && <div className="error">{error}</div>}
+            <form onSubmit={submitCode}>
+              <label>Authentication code</label>
+              <input
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                placeholder="123456"
+                maxLength={6}
+                autoFocus
+                required
+              />
+              <button className="btn" style={{ width: "100%", marginTop: 18 }} disabled={busy}>
+                {busy ? "Verifying…" : "Verify & sign in"}
+              </button>
+            </form>
+            <button
+              type="button"
+              className="linkish-plain muted"
+              style={{ marginTop: 14 }}
+              onClick={() => {
+                setFactorId(null);
+                setCode("");
+                setError("");
+              }}
+            >
+              ← Back
+            </button>
+          </>
+        ) : (
+          <>
         <h1 style={{ marginTop: 0 }}>Welcome back</h1>
         <p className="muted">Log in to book services or manage your business.</p>
         {error && <div className="error">{error}</div>}
@@ -78,6 +139,8 @@ export default function Login() {
             </button>
           </div>
         </div>
+          </>
+        )}
       </div>
     </div>
   );
