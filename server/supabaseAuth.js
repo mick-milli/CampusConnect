@@ -33,6 +33,19 @@ export const supaAuth = {
       token: KEY,
       body: { email, password, email_confirm: true, user_metadata: metadata },
     }),
+  // Public self-service signup. When the project has "Confirm email" enabled,
+  // GoTrue emails a confirmation link and returns the new user WITHOUT a session;
+  // otherwise it returns a live session (auto-confirmed). `redirectTo` is where
+  // the user lands after clicking the link (must be in the project's allowlist).
+  signUp: ({ email, password, metadata, redirectTo }) =>
+    call("POST", `/signup${redirectTo ? `?redirect_to=${encodeURIComponent(redirectTo)}` : ""}`, {
+      body: { email, password, data: metadata },
+    }),
+  // Re-send the signup confirmation email (link expired or never arrived).
+  resendSignup: ({ email, redirectTo }) =>
+    call("POST", `/resend${redirectTo ? `?redirect_to=${encodeURIComponent(redirectTo)}` : ""}`, {
+      body: { type: "signup", email },
+    }),
   signIn: (email, password) =>
     call("POST", "/token?grant_type=password", { body: { email, password } }),
   refresh: (refresh_token) =>

@@ -8,10 +8,13 @@ import { randomUUID, createHmac } from "crypto";
 import multer from "multer";
 import { load, flush, USING_SUPABASE, Categories, Users, Services, Orders, Reviews, Notifications, Messages } from "./db.js";
 import { supaAuth, AUTH_ENABLED } from "./supabaseAuth.js";
+import { STORAGE_ENABLED, isStorageUrl, ensureBucket, putObject } from "./storage.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// The built React app (single-service deploy); absent during local dev (Vite).
+const CLIENT_DIST = path.join(__dirname, "..", "client", "dist");
 
 const PORT = process.env.PORT || 4000;
 
@@ -61,6 +64,16 @@ const STATUS_LABELS = {
 
 const money = (n) => `GH₵ ${Number(n || 0).toFixed(2)}`;
 
+// Platform commission taken from a provider's payout on each successfully
+// completed (released) order. A flagged/refunded order never releases, so it's
+// never charged — the 5% only ever applies to a clean sale.
+const PLATFORM_FEE_RATE = 0.05;
+const feeBreakdown = (amount) => {
+  const gross = Number(amount) || 0;
+  const fee = Math.round(gross * PLATFORM_FEE_RATE * 100) / 100;
+  return { fee, net: Math.round((gross - fee) * 100) / 100 };
+};
+
 // Payment methods. "cash" is settled in person on delivery; "momo" and "card"
 // are online methods whose funds are held in escrow until work is confirmed.
 const PAY_METHODS = ["cash", "momo", "card"];
@@ -99,6 +112,8 @@ app.use(
   })
 );
 app.use("/uploads", express.static(UPLOADS_DIR));
+// In production the API also serves the built React app (single-service deploy).
+if (fs.existsSync(CLIENT_DIST)) app.use(express.static(CLIENT_DIST));
 
 // ---- media uploads (service photos & videos) ----
 const MEDIA_MIMES = {
@@ -111,27 +126,27 @@ const MEDIA_MIMES = {
 };
 const MAX_MEDIA = 6;
 
+// Buffer uploads in memory so we can hand them to Supabase Storage (or, in
+// local dev, write them to the uploads dir ourselves — see storeUpload).
 const uploadMedia = multer({
-  storage: multer.diskStorage({
-    destination: UPLOADS_DIR,
-    filename: (_req, file, cb) => cb(null, `${randomUUID()}.${MEDIA_MIMES[file.mimetype].ext}`),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 80 * 1024 * 1024, files: MAX_MEDIA },
   fileFilter: (_req, file, cb) => cb(null, Boolean(MEDIA_MIMES[file.mimetype])),
 });
 
-// Keep only well-formed {url,type} entries that point at files we actually have.
+// A URL we produced ourselves: a Supabase Storage object (when configured) or a
+// local uploads file that's actually on disk (dev fallback).
+function isValidUploadUrl(url) {
+  if (typeof url !== "string" || !url) return false;
+  if (STORAGE_ENABLED) return isStorageUrl(url);
+  return /^\/uploads\/[\w-]+\.[a-z0-9]+$/.test(url) && fs.existsSync(path.join(UPLOADS_DIR, path.basename(url)));
+}
+
+// Keep only well-formed {url,type} entries that point at media we host.
 function sanitizeMedia(media) {
   if (!Array.isArray(media)) return [];
   return media
-    .filter(
-      (m) =>
-        m &&
-        ["image", "video"].includes(m.type) &&
-        typeof m.url === "string" &&
-        /^\/uploads\/[\w-]+\.[a-z0-9]+$/.test(m.url) &&
-        fs.existsSync(path.join(UPLOADS_DIR, path.basename(m.url)))
-    )
+    .filter((m) => m && ["image", "video"].includes(m.type) && isValidUploadUrl(m.url))
     .map((m) => ({ url: m.url, type: m.type }))
     .slice(0, MAX_MEDIA);
 }
@@ -139,19 +154,23 @@ function sanitizeMedia(media) {
 // ---- avatar uploads (single profile image) ----
 const AVATAR_MIMES = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
 const uploadAvatar = multer({
-  storage: multer.diskStorage({
-    destination: UPLOADS_DIR,
-    filename: (_req, file, cb) => cb(null, `avatar-${randomUUID()}.${AVATAR_MIMES[file.mimetype]}`),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => cb(null, Boolean(AVATAR_MIMES[file.mimetype])),
 });
 
-// A single uploaded-image URL we actually have on disk, or "" if it's bogus.
+// A single uploaded-image URL we host, or "" if it's bogus.
 function sanitizeAvatar(url) {
-  if (typeof url !== "string" || !url) return "";
-  if (!/^\/uploads\/[\w-]+\.[a-z0-9]+$/.test(url)) return "";
-  return fs.existsSync(path.join(UPLOADS_DIR, path.basename(url))) ? url : "";
+  return isValidUploadUrl(url) ? url : "";
+}
+
+// Persist an uploaded (in-memory) file and return its public URL. Supabase
+// Storage when configured; otherwise the local uploads dir for zero-config dev.
+async function storeUpload(file, ext) {
+  if (STORAGE_ENABLED) return putObject(file.buffer, file.mimetype, ext);
+  const filename = `${randomUUID()}.${ext}`;
+  fs.writeFileSync(path.join(UPLOADS_DIR, filename), file.buffer);
+  return `/uploads/${filename}`;
 }
 
 // ---- helpers ----
@@ -197,8 +216,9 @@ function tokenAal(token) {
   }
 }
 
-// Ensure a local cc_users profile exists for a Supabase auth user, linked by
-// email so every existing order/service/review reference stays intact.
+// Ensure a local profile (in cc_providers/cc_customers, by role) exists for a
+// Supabase auth user, linked by email so every existing order/service/review
+// reference stays intact.
 function profileFor(authUser) {
   const email = (authUser.email || "").toLowerCase();
   let profile = Users.find((u) => u.email.toLowerCase() === email);
@@ -274,6 +294,85 @@ function decorateService(s) {
   return { ...s, provider, category, ratingAvg, ratingCount };
 }
 
+// Decorate a provider (a user) into a storefront summary for the browse pages:
+// the categories & service types they cover, how many active listings they have,
+// an aggregate rating across all their work, and a cover image. With
+// `withServices`, also attach the full decorated listing set (storefront page).
+function decorateProvider(u, { withServices = false } = {}) {
+  if (!u || u.role !== "provider" || u.deactivated) return null;
+  const services = Services.filter(
+    (s) => s.providerId === u.id && s.active !== false && !s.deleted
+  ).sort((a, b) => b.createdAt - a.createdAt);
+  // Unique categories the provider offers something in, in listing order.
+  const seen = new Set();
+  const categories = [];
+  for (const s of services) {
+    if (seen.has(s.categoryId)) continue;
+    seen.add(s.categoryId);
+    const c = Categories.byId(s.categoryId);
+    if (c) categories.push({ id: c.id, name: c.name, icon: c.icon });
+  }
+  const serviceTypes = [...new Set(services.map((s) => s.serviceType || s.title).filter(Boolean))];
+  const reviews = Reviews.filter((r) => r.providerId === u.id);
+  const ratingCount = reviews.length;
+  const ratingAvg = ratingCount
+    ? Math.round((reviews.reduce((sum, r) => sum + r.rating, 0) / ratingCount) * 10) / 10
+    : 0;
+  const thumbnail = services.find((s) => s.media?.length)?.media[0]?.url || null;
+
+  // This endpoint is public, so expose only what the storefront UI shows —
+  // no contact details (email/phone) to anonymous visitors.
+  const { id, name, role, location, avatar, bio } = publicUser(u);
+  const card = {
+    id,
+    name,
+    role,
+    location,
+    avatar,
+    bio,
+    headline: bio || (categories.length ? categories.map((c) => c.name).join(" · ") : ""),
+    categories,
+    serviceTypes,
+    serviceCount: services.length,
+    ratingAvg,
+    ratingCount,
+    thumbnail,
+  };
+  if (withServices) card.services = services.map(decorateService);
+  return card;
+}
+
+// The provider must get a fair chance to make it right before any refund, and a
+// flag needs an evidence trail. So the customer first raises it in the order
+// chat; then either the provider has replied, or a grace window has passed with
+// no response — so a silent provider can't block a refund forever.
+const FLAG_SILENCE_MS = Number(process.env.FLAG_SILENCE_MS) || 24 * 60 * 60 * 1000;
+
+function flagChatEligibility(o) {
+  const msgs = Messages.forOrder(o.id);
+  const fromCustomer = msgs.filter((m) => m.senderId === o.customerId);
+  if (!fromCustomer.length) return { ok: false, stage: "raise" };
+  if (msgs.some((m) => m.senderId === o.providerId)) return { ok: true, stage: "eligible" };
+  // No provider reply yet — allow only once the grace window since the
+  // customer's most recent message has elapsed.
+  const until = Math.max(...fromCustomer.map((m) => m.createdAt)) + FLAG_SILENCE_MS;
+  if (Date.now() >= until) return { ok: true, stage: "eligible" };
+  return { ok: false, stage: "wait", until };
+}
+
+// Work stages during which a funded order can be flagged for uncompleted work.
+const FLAGGABLE_STATES = ["in_progress", "out_for_delivery", "delivered"];
+
+// Whether/why the customer may flag this order right now (null = not in the flag
+// window at all). Drives the flag button + hints, and mirrors the /flag guard.
+function flagState(o) {
+  const inWindow =
+    ONLINE_METHODS.includes(o.payment?.method) &&
+    o.payment?.status === "in_escrow" &&
+    FLAGGABLE_STATES.includes(o.status);
+  return inWindow ? flagChatEligibility(o) : null;
+}
+
 function decorateOrder(o, viewerId = null) {
   if (!o) return null;
   // Unread chat messages for whoever's asking: those sent by the other party
@@ -293,12 +392,31 @@ function decorateOrder(o, viewerId = null) {
     // The customer's review for this order, if they've left one.
     review: Reviews.byOrder(o.id),
     unread,
+    // Whether/why the customer may flag right now — drives the button + hints.
+    flagState: flagState(o),
     // Provider payout state — internal transfer codes are kept server-side.
     payout: o.payout ? { status: o.payout.status, amount: o.payout.amount, at: o.payout.at } : null,
   };
 }
 
+// Normalize a display name for duplicate detection: fold accents & case, and
+// treat any run of punctuation/whitespace as a single gap. So "Kwame  Prints!"
+// and "kwame-prints" collide with "Kwame Prints".
+const normalizeName = (s) =>
+  String(s || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "") // drop combining accent marks
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
 // ---- auth routes ----
+
+// Where GoTrue should send a user after they click an email link. Uses the
+// browser's own origin (the Vite dev server in dev, the deployed site in prod),
+// so links work in both without extra config; override with CLIENT_URL.
+const clientOrigin = (req) => process.env.CLIENT_URL || req.headers.origin || `http://localhost:${PORT}`;
+
 app.post("/api/auth/register", async (req, res) => {
   const { name, email, password, role, phone, location } = req.body || {};
   if (!name || !email || !password)
@@ -308,24 +426,52 @@ app.post("/api/auth/register", async (req, res) => {
   if (String(password).length < 6)
     return res.status(400).json({ error: "Password must be at least 6 characters" });
 
+  // Provider names appear in the public directory, so they must be distinct
+  // (normalized). Customers may legitimately share real names, so they're exempt.
+  if ((role || "customer") === "provider") {
+    const norm = normalizeName(name);
+    if (norm && Users.find((u) => u.role === "provider" && normalizeName(u.name) === norm))
+      return res
+        .status(409)
+        .json({ error: "A provider with that name already exists — please choose a different one." });
+  }
+
+  let result;
   try {
-    await supaAuth.adminCreateUser({
+    result = await supaAuth.signUp({
       email,
       password,
       metadata: { name, role: role || "customer", phone: phone || "", location: location || "" },
+      redirectTo: `${clientOrigin(req)}/auth/confirm`,
     });
   } catch (e) {
     if (e.status === 422 || /already|registered|exists/i.test(e.message))
       return res.status(409).json({ error: "An account with that email already exists" });
     return res.status(400).json({ error: e.message });
   }
+
+  // Email confirmation is on: GoTrue created the user and emailed a link, but
+  // returned no session. The user can't sign in until they click it.
+  if (!result.access_token)
+    return res.status(201).json({ pending: true, email });
+
+  // Confirmation is off on this project → GoTrue returned a live session, so we
+  // sign the user straight in (keeps local/dev working without SMTP).
+  const profile = profileFor(result.user);
+  res.status(201).json({ token: result.access_token, refreshToken: result.refresh_token, user: selfUser(profile) });
+});
+
+// Re-send the signup confirmation email. Always reports success — we don't
+// reveal whether an address is registered (or already confirmed).
+app.post("/api/auth/resend", async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: "Email is required" });
   try {
-    const sess = await supaAuth.signIn(email, password);
-    const profile = profileFor(sess.user);
-    res.status(201).json({ token: sess.access_token, refreshToken: sess.refresh_token, user: selfUser(profile) });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
+    await supaAuth.resendSignup({ email, redirectTo: `${clientOrigin(req)}/auth/confirm` });
+  } catch {
+    /* swallow — a bad/confirmed/rate-limited address must look the same */
   }
+  res.json({ ok: true });
 });
 
 app.post("/api/auth/login", async (req, res) => {
@@ -414,9 +560,14 @@ app.post("/api/auth/mfa/disable", auth(), async (req, res) => {
 });
 
 // Upload a profile picture (any signed-in user) → returns its URL.
-app.post("/api/avatar", auth(), uploadAvatar.single("file"), (req, res) => {
+app.post("/api/avatar", auth(), uploadAvatar.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Please choose an image (JPG, PNG or WebP)" });
-  res.status(201).json({ url: `/uploads/${req.file.filename}` });
+  try {
+    const url = await storeUpload(req.file, AVATAR_MIMES[req.file.mimetype]);
+    res.status(201).json({ url });
+  } catch (e) {
+    res.status(502).json({ error: `Couldn't upload image: ${e.message}` });
+  }
 });
 
 // Edit your own profile — name, short bio, contact and avatar.
@@ -426,6 +577,15 @@ app.patch("/api/auth/me", auth(), (req, res) => {
   if (name !== undefined) {
     const n = String(name).trim();
     if (!n) return res.status(400).json({ error: "Name can't be empty" });
+    // Same rule as registration: a provider can't rename to another provider's
+    // (normalized) name. Excludes themselves, so tweaking your own casing is fine.
+    if (req.user.role === "provider") {
+      const norm = normalizeName(n);
+      if (norm && Users.find((u) => u.role === "provider" && u.id !== req.user.id && normalizeName(u.name) === norm))
+        return res
+          .status(409)
+          .json({ error: "A provider with that name already exists — please choose a different one." });
+    }
     patch.name = n.slice(0, 80);
   }
   if (bio !== undefined) patch.bio = String(bio).trim().slice(0, 300);
@@ -478,10 +638,43 @@ app.post("/api/auth/deactivate", auth(), async (req, res) => {
 // ---- categories ----
 app.get("/api/categories", (_req, res) => res.json(Categories.all()));
 
+// ---- providers (public storefronts) ----
+// The marketplace is browsed provider-first (Alibaba-style). These are public so
+// the landing page can showcase real providers before a visitor signs in.
+app.get("/api/providers", (req, res) => {
+  const { category, q } = req.query;
+  let list = Users.all()
+    .filter((u) => u.role === "provider" && !u.deactivated)
+    .map((u) => decorateProvider(u))
+    .filter((p) => p && p.serviceCount > 0);
+  if (category) list = list.filter((p) => p.categories.some((c) => c.id === category));
+  if (q) {
+    const needle = String(q).toLowerCase();
+    const has = (v) => (v || "").toLowerCase().includes(needle);
+    list = list.filter(
+      (p) =>
+        has(p.name) ||
+        has(p.headline) ||
+        has(p.location) ||
+        p.categories.some((c) => has(c.name)) ||
+        p.serviceTypes.some((t) => has(t))
+    );
+  }
+  // Best-rated, then most listings, first.
+  list.sort((a, b) => b.ratingAvg - a.ratingAvg || b.serviceCount - a.serviceCount);
+  res.json(list);
+});
+
+app.get("/api/providers/:id", (req, res) => {
+  const provider = decorateProvider(Users.byId(req.params.id), { withServices: true });
+  if (!provider) return res.status(404).json({ error: "Provider not found" });
+  res.json(provider);
+});
+
 // ---- services ----
 app.get("/api/services", auth(), (req, res) => {
   const { category, q } = req.query;
-  let list = Services.filter((s) => s.active !== false);
+  let list = Services.filter((s) => s.active !== false && !s.deleted);
   if (category) list = list.filter((s) => s.categoryId === category);
   if (q) {
     const needle = q.toLowerCase();
@@ -494,12 +687,14 @@ app.get("/api/services", auth(), (req, res) => {
 });
 
 app.get("/api/services/mine", auth(), requireRole("provider"), (req, res) => {
-  res.json(Services.filter((s) => s.providerId === req.user.id).map(decorateService));
+  res.json(
+    Services.filter((s) => s.providerId === req.user.id && !s.deleted).map(decorateService)
+  );
 });
 
 app.get("/api/services/:id", auth(), (req, res) => {
   const s = Services.byId(req.params.id);
-  if (!s) return res.status(404).json({ error: "Service not found" });
+  if (!s || s.deleted) return res.status(404).json({ error: "Service not found" });
   res.json(decorateService(s));
 });
 
@@ -512,18 +707,23 @@ app.get("/api/services/:id/reviews", auth(), (req, res) => {
 });
 
 // Step 1: providers upload photos/videos here (multipart), get back their URLs.
-app.post("/api/media", auth(), requireRole("provider"), uploadMedia.array("files", MAX_MEDIA), (req, res) => {
-  res.status(201).json({
-    media: (req.files || []).map((f) => ({
-      url: `/uploads/${f.filename}`,
-      type: MEDIA_MIMES[f.mimetype].type,
-    })),
-  });
+app.post("/api/media", auth(), requireRole("provider"), uploadMedia.array("files", MAX_MEDIA), async (req, res) => {
+  try {
+    const media = await Promise.all(
+      (req.files || []).map(async (f) => ({
+        url: await storeUpload(f, MEDIA_MIMES[f.mimetype].ext),
+        type: MEDIA_MIMES[f.mimetype].type,
+      }))
+    );
+    res.status(201).json({ media });
+  } catch (e) {
+    res.status(502).json({ error: `Couldn't upload files: ${e.message}` });
+  }
 });
 
 // Step 2: the service is created referencing the uploaded media.
 app.post("/api/services", auth(), requireRole("provider"), (req, res) => {
-  const { title, description, price, categoryId, categoryName, media } = req.body || {};
+  const { title, description, price, categoryId, categoryName, serviceType, media } = req.body || {};
   if (!title) return res.status(400).json({ error: "Title is required" });
 
   // Providers can pick an existing category or create a new one by name
@@ -542,6 +742,9 @@ app.post("/api/services", auth(), requireRole("provider"), (req, res) => {
     providerId: req.user.id,
     categoryId: category.id,
     title,
+    // The shared label the browse pages group providers under; defaults to the
+    // title so a listing always groups somewhere even if the field is left blank.
+    serviceType: String(serviceType || "").trim().slice(0, 80) || title,
     description: description || "",
     price: Number(price) || 0,
     media: sanitizeMedia(media),
@@ -551,15 +754,39 @@ app.post("/api/services", auth(), requireRole("provider"), (req, res) => {
 
 app.patch("/api/services/:id", auth(), requireRole("provider"), (req, res) => {
   const s = Services.byId(req.params.id);
-  if (!s) return res.status(404).json({ error: "Service not found" });
+  if (!s || s.deleted) return res.status(404).json({ error: "Service not found" });
   if (s.providerId !== req.user.id) return res.status(403).json({ error: "Not your service" });
-  const { title, description, price, active } = req.body || {};
+  const { title, description, price, active, serviceType, media, categoryId } = req.body || {};
   const patch = {};
-  if (title !== undefined) patch.title = title;
+  if (title !== undefined) {
+    if (!String(title).trim()) return res.status(400).json({ error: "Title can't be empty" });
+    patch.title = String(title).trim();
+  }
+  if (serviceType !== undefined) patch.serviceType = String(serviceType).trim().slice(0, 80);
   if (description !== undefined) patch.description = description;
   if (price !== undefined) patch.price = Number(price) || 0;
   if (active !== undefined) patch.active = !!active;
+  // Only the uploaded media the provider kept (or newly added) are persisted;
+  // sanitizeMedia drops anything not backed by a real file on disk.
+  if (media !== undefined) patch.media = sanitizeMedia(media);
+  // Switching to a different existing category (new categories are created at
+  // publish time, not here).
+  if (categoryId !== undefined) {
+    const category = Categories.byId(categoryId);
+    if (!category) return res.status(400).json({ error: "Unknown category" });
+    patch.categoryId = category.id;
+  }
   res.json(decorateService(Services.update(s.id, patch)));
+});
+
+// Soft-delete: the listing disappears from the marketplace and the provider's
+// dashboard, but the record is kept so past orders still resolve their details.
+app.delete("/api/services/:id", auth(), requireRole("provider"), (req, res) => {
+  const s = Services.byId(req.params.id);
+  if (!s || s.deleted) return res.status(404).json({ error: "Service not found" });
+  if (s.providerId !== req.user.id) return res.status(403).json({ error: "Not your service" });
+  Services.update(s.id, { deleted: true, active: false });
+  res.json({ ok: true });
 });
 
 // ---- orders ----
@@ -655,10 +882,16 @@ app.patch("/api/orders/:id/status", auth(), async (req, res) => {
     history: [...(o.history || []), { status, at: Date.now() }],
   };
   // Release escrowed funds to the provider once the customer confirms the work
-  // is done; refund them if a funded order is cancelled.
+  // is done; refund them if a funded order is cancelled. On release we lock in
+  // the platform fee and the net the provider is owed.
   if (o.payment?.status === "in_escrow") {
     if (status === "completed")
-      patch.payment = { ...o.payment, status: "released", releasedAt: Date.now() };
+      patch.payment = {
+        ...o.payment,
+        status: "released",
+        releasedAt: Date.now(),
+        ...feeBreakdown(o.payment.amount),
+      };
     else if (status === "cancelled")
       patch.payment = { ...o.payment, status: "refunded" };
   }
@@ -674,20 +907,58 @@ app.patch("/api/orders/:id/status", auth(), async (req, res) => {
       : `Order "${service?.title || "service"}" is now ${label}`;
   notify(recipientId, "status", text, o.id);
 
-  // On release, pay the provider out via Transfers; on refund, tell the customer.
+  // On release, pay the provider out via Transfers; on refund, reverse the
+  // customer's escrow charge (refundEscrow notifies them).
   if (patch.payment?.status === "released") {
     await payProvider(updated);
     updated = Orders.byId(o.id); // pick up the payout state payProvider wrote
   }
-  if (patch.payment?.status === "refunded")
-    notify(
-      o.customerId,
-      "payment",
-      `Refunded ${money(o.payment.amount)} for the cancelled "${service?.title || "order"}".`,
-      o.id
-    );
+  if (patch.payment?.status === "refunded") {
+    await refundEscrow(updated);
+    updated = Orders.byId(o.id);
+  }
 
   res.json(decorateOrder(updated, req.user.id));
+});
+
+// A customer flags an order for uncompleted work → full refund, order closed.
+// Only once the money is actually in escrow, the work is underway, and the two
+// parties have talked it over in the order chat — so the provider had a fair
+// chance to resolve it first, and there's a record of the dispute.
+app.post("/api/orders/:id/flag", auth(), requireRole("customer"), async (req, res) => {
+  const o = Orders.byId(req.params.id);
+  if (!o) return res.status(404).json({ error: "Order not found" });
+  if (o.customerId !== req.user.id) return res.status(403).json({ error: "Not your order" });
+  if (o.payment?.status !== "in_escrow")
+    return res.status(400).json({ error: "Only an order with money still held in escrow can be flagged" });
+  if (!FLAGGABLE_STATES.includes(o.status))
+    return res.status(400).json({ error: "You can flag once the provider has started the work" });
+  const chat = flagChatEligibility(o);
+  if (!chat.ok)
+    return res.status(409).json({
+      error:
+        chat.stage === "wait"
+          ? "You've raised this with the provider — you can flag if it's still unresolved 24 hours after your message."
+          : "Message the provider in the order chat to raise the issue before flagging.",
+    });
+
+  const reason = String(req.body?.reason || "").trim().slice(0, 500);
+  const service = Services.byId(o.serviceId);
+  const updated = Orders.update(o.id, {
+    status: "cancelled",
+    payment: { ...o.payment, status: "refunded" },
+    flag: { reason, at: Date.now(), by: "customer" },
+    history: [...(o.history || []), { status: "cancelled", at: Date.now() }],
+  });
+  notify(
+    o.providerId,
+    "payment",
+    `${req.user.name} flagged "${service?.title || "an order"}" as uncompleted — ${money(o.payment.amount)} is being refunded to them.`,
+    o.id
+  );
+  // Reverse the customer's escrow charge (this notifies them).
+  await refundEscrow(updated);
+  res.json(decorateOrder(Orders.byId(o.id), req.user.id));
 });
 
 // ---- escrow payment (customer funds an accepted order via MoMo/card) ----
@@ -709,6 +980,39 @@ function fundEscrow(o, reference) {
   return updated;
 }
 
+// Reverse a customer's escrow charge when an order is refunded (cancelled or
+// flagged). Cash, unfunded and simulated (dev) charges never moved real money,
+// so they're a no-op beyond recording the state. Records refund state on the
+// order and notifies the customer; safe to call once per refund.
+//   simulated → dev/no real charge   ·   pending → Paystack processing
+//   processed → money returned       ·   failed → needs manual follow-up
+async function refundEscrow(o) {
+  const pay = o.payment || {};
+  const amount = pay.amount || 0;
+  const service = Services.byId(o.serviceId);
+  const setRefund = (r) => Orders.update(o.id, { payment: { ...pay, refund: { at: Date.now(), ...r } } });
+
+  const noRealCharge =
+    !PAYSTACK_ENABLED || !ONLINE_METHODS.includes(pay.method) || !pay.reference || String(pay.reference).startsWith("sim_");
+  if (noRealCharge) {
+    setRefund({ status: "simulated" });
+    notify(o.customerId, "payment", `${money(amount)} has been refunded to you for "${service?.title || "the order"}".`, o.id);
+    return;
+  }
+  try {
+    const data = await paystack("/refund", {
+      method: "POST",
+      body: { transaction: pay.reference, amount: toMinor(amount) },
+    });
+    setRefund({ status: data?.status === "processed" ? "processed" : "pending", reference: pay.reference });
+    notify(o.customerId, "payment", `Your ${money(amount)} refund for "${service?.title || "the order"}" is on its way.`, o.id);
+  } catch (e) {
+    setRefund({ status: "failed", error: e.message });
+    notify(o.customerId, "payment", `We couldn't process your ${money(amount)} refund automatically — support will sort it out.`, o.id);
+    console.error(`Paystack refund for order ${o.id}: ${e.message}`);
+  }
+}
+
 // Pay the provider their escrowed funds via a Paystack Transfer once the order
 // is released. Records payout state on the order; safe to retry.
 //   awaiting_details → provider has no payout destination yet
@@ -716,7 +1020,9 @@ function fundEscrow(o, reference) {
 //   paid → money sent   ·   failed → transfer error, retryable
 async function payProvider(o) {
   const provider = Users.byId(o.providerId);
-  const amount = o.payment?.amount || 0;
+  // The provider is paid their net share — the customer's payment minus the
+  // platform fee locked in at release (older orders fall back to the gross).
+  const amount = o.payment?.net ?? o.payment?.amount ?? 0;
   const service = Services.byId(o.serviceId);
   const setPayout = (p) => Orders.update(o.id, { payout: { amount, at: Date.now(), ...p } });
 
@@ -780,7 +1086,7 @@ function payabilityError(o, req) {
 
 // Lets the client know whether to run the real Paystack flow or the dev fallback.
 app.get("/api/config", (_req, res) => {
-  res.json({ paystackEnabled: PAYSTACK_ENABLED, currency: "GHS" });
+  res.json({ paystackEnabled: PAYSTACK_ENABLED, currency: "GHS", platformFeeRate: PLATFORM_FEE_RATE });
 });
 
 // Start a payment. With Paystack configured this initializes a transaction and
@@ -885,6 +1191,25 @@ app.post("/api/paystack/webhook", (req, res) => {
         paid
           ? `${money(o.payout?.amount)} paid out to you.`
           : `A payout of ${money(o.payout?.amount)} failed — please check your payout details.`,
+        o.id
+      );
+    }
+  }
+  // Customer refund settled or bounced → record it and let them know.
+  if (["refund.processed", "refund.failed"].includes(evt?.event)) {
+    const ref = evt.data?.transaction_reference || evt.data?.transaction?.reference;
+    const o = ref ? Orders.filter((x) => x.payment?.reference === ref)[0] : null;
+    if (o) {
+      const done = evt.event === "refund.processed";
+      Orders.update(o.id, {
+        payment: { ...o.payment, refund: { ...(o.payment.refund || {}), status: done ? "processed" : "failed", at: Date.now() } },
+      });
+      notify(
+        o.customerId,
+        "payment",
+        done
+          ? `${money(o.payment?.amount)} has been refunded to you.`
+          : `Your ${money(o.payment?.amount)} refund didn't go through — support will help sort it out.`,
         o.id
       );
     }
@@ -1065,10 +1390,20 @@ app.post("/api/notifications/read", auth(), (req, res) => {
 // ---- misc ----
 app.get("/api/health", (_req, res) => res.json({ ok: true, service: "CampusConnect API" }));
 
+// SPA fallback: any non-API GET returns the app shell so client-side routes
+// (e.g. /orders, /auth/confirm) resolve on a hard refresh or an email link.
+if (fs.existsSync(CLIENT_DIST)) {
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api/") || req.path.startsWith("/uploads/")) return next();
+    res.sendFile(path.join(CLIENT_DIST, "index.html"));
+  });
+}
+
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 
-// Load the datastore (from Supabase or the local file), then start serving.
+// Load the datastore, ensure the storage bucket exists, then start serving.
 load()
+  .then(ensureBucket)
   .then(() => {
     app.listen(PORT, () => {
       console.log(

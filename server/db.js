@@ -25,6 +25,7 @@ const DEFAULT_CATEGORIES = [
   { id: "courier", name: "Courier & Delivery", icon: "📦", description: "Campus-wide package pickup and drop-off" },
   { id: "event", name: "Event-Based", icon: "🎉", description: "Event planning, decoration, MCs, DJs" },
   { id: "beauty", name: "Personal & Beauty", icon: "💇", description: "Hairdressing, barbering, makeup, nails at home" },
+  { id: "laundry", name: "Laundry & Ironing", icon: "🧺", description: "Wash, dry, fold and ironing — picked up and delivered to your hostel" },
 ];
 
 // Old fixed categories that no longer exist → their closest replacement.
@@ -36,7 +37,8 @@ const RETIRED_CATEGORY_MAP = {
 };
 
 const empty = () => ({
-  users: [],
+  providers: [],
+  customers: [],
   services: [],
   orders: [],
   reviews: [],
@@ -47,13 +49,18 @@ const empty = () => ({
 
 let db = empty();
 
+// Providers and customers are stored in separate collections/tables, but most
+// of the app treats "users" as one set — these read/route across both.
+const allUsers = () => [...db.providers, ...db.customers];
+const userTable = (role) => (role === "provider" ? "providers" : "customers");
+
 // ---- persistence backend ----
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 export const USING_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
 // One table per collection, each row = { id, data: <the object> }.
-const COLLECTIONS = ["categories", "users", "services", "orders", "reviews", "notifications", "messages"];
+const COLLECTIONS = ["categories", "providers", "customers", "services", "orders", "reviews", "notifications", "messages"];
 const TABLE = Object.fromEntries(COLLECTIONS.map((c) => [c, "cc_" + c]));
 
 // We talk to Supabase's REST API (PostgREST) directly over fetch — no SDK, so
@@ -153,7 +160,25 @@ async function loadFromSupabase() {
     db[c] = (rows || []).map((row) => row.data);
   }
 
-  if (db.users.length === 0) {
+  // One-time migration from the legacy single cc_users table into the split
+  // cc_providers / cc_customers tables (cc_users is left in place as a backup).
+  if (db.providers.length + db.customers.length === 0) {
+    let legacy = [];
+    try {
+      legacy = ((await sbRequest("GET", `/cc_users?select=data`)) || []).map((r) => r.data);
+    } catch {
+      /* cc_users may not exist on a fresh project — nothing to migrate */
+    }
+    if (legacy.length) {
+      db.providers = legacy.filter((u) => u.role === "provider");
+      db.customers = legacy.filter((u) => u.role !== "provider");
+      await pushAll("providers");
+      await pushAll("customers");
+      console.log(`Migrated ${legacy.length} users from cc_users into cc_providers/cc_customers.`);
+    }
+  }
+
+  if (allUsers().length === 0) {
     // First run against an empty project — import the local file if we have one,
     // otherwise seed fresh demo data. Either way, push it up to Supabase.
     if (fs.existsSync(DATA_FILE)) {
@@ -191,6 +216,13 @@ async function pushAll(only) {
 // Bring older layouts up to date, in memory. Returns whether anything changed.
 function migrate() {
   let changed = false;
+  // Split the legacy single `users` collection into providers + customers.
+  if (Array.isArray(db.users)) {
+    db.providers = [...(db.providers || []), ...db.users.filter((u) => u.role === "provider")];
+    db.customers = [...(db.customers || []), ...db.users.filter((u) => u.role !== "provider")];
+    delete db.users;
+    changed = true;
+  }
   if (!db.categories) {
     db.categories = [...DEFAULT_CATEGORIES];
     for (const s of db.services || []) {
@@ -202,6 +234,12 @@ function migrate() {
     if (s.images && !s.media) {
       s.media = s.images.map((url) => ({ url, type: "image" }));
       delete s.images;
+      changed = true;
+    }
+    // Provider-centric browse groups listings by service type; older listings
+    // predate the field, so seed it from the title (each becomes its own type).
+    if (s.serviceType === undefined) {
+      s.serviceType = s.title || "";
       changed = true;
     }
   }
@@ -254,11 +292,22 @@ function seedInMemory() {
   };
 
   const providers = [
-    { name: "Kwame Prints", email: "kwame@knust.edu.gh", location: "Commercial Area", phone: "0201112222" },
-    { name: "Adjoa Couriers", email: "adjoa@knust.edu.gh", location: "Pentagon Hostel", phone: "0203334444" },
-    { name: "Yaw Tech Hub", email: "yaw@knust.edu.gh", location: "Brunei Complex", phone: "0205556666" },
-    { name: "Kojo Shots", email: "kojo@knust.edu.gh", location: "Ayeduase Gate", phone: "0207778888" },
-    { name: "Esi Beauty Hub", email: "esi@knust.edu.gh", location: "Kotei Junction", phone: "0209990000" },
+    { name: "Kwame Prints", email: "kwame@knust.edu.gh", location: "Commercial Area", phone: "0201112222", bio: "Same-day printing, binding & photocopying delivered to your hall." },
+    { name: "Adjoa Couriers", email: "adjoa@knust.edu.gh", location: "Pentagon Hostel", phone: "0203334444", bio: "Fast campus courier and gas refill runs." },
+    { name: "Yaw Tech Hub", email: "yaw@knust.edu.gh", location: "Brunei Complex", phone: "0205556666", bio: "Web & app builds, device repairs, rentals and used gadgets." },
+    { name: "Kojo Shots", email: "kojo@knust.edu.gh", location: "Ayeduase Gate", phone: "0207778888", bio: "Event & portrait photography plus DJ/MC services." },
+    { name: "Esi Beauty Hub", email: "esi@knust.edu.gh", location: "Kotei Junction", phone: "0209990000", bio: "Braids, makeup and nails done right in your hostel." },
+    { name: "Kofi Fix", email: "kofi@knust.edu.gh", location: "Ayeduase Gate", phone: "0201234321", bio: "Phone & laptop repairs with a 24-hour turnaround." },
+    { name: "Akosua Printworks", email: "akosua@knust.edu.gh", location: "Ayeduase Gate", phone: "0244001100", bio: "Colour printing, lamination and thesis binding at student rates." },
+    { name: "Swift Campus Errands", email: "swift@knust.edu.gh", location: "SRC Block", phone: "0244002200", bio: "Reliable pickups and drop-offs anywhere on campus." },
+    { name: "FlameGas Express", email: "flamegas@knust.edu.gh", location: "Kotei Junction", phone: "0244003300", bio: "Same-day LPG cylinder pickup, refill and return." },
+    { name: "Nsroma Web Studio", email: "nsroma@knust.edu.gh", location: "Brunei Complex", phone: "0244004400", bio: "Websites, portfolios and mobile apps for campus hustles." },
+    { name: "Lens & Light Studio", email: "lenslight@knust.edu.gh", location: "Republic Hall", phone: "0244005500", bio: "Photography, videography and event hosting for every occasion." },
+    { name: "PlayZone Rentals", email: "playzone@knust.edu.gh", location: "Unity Hall", phone: "0244006600", bio: "Consoles, pads, projectors and small appliances by the day." },
+    { name: "Glow Beauty Bar", email: "glow@knust.edu.gh", location: "Ayeduase New Site", phone: "0244007700", bio: "Braids, nails and makeup for classes, dates and events." },
+    { name: "TradeUp KNUST", email: "tradeup@knust.edu.gh", location: "Commercial Area", phone: "0244008800", bio: "Buy, sell and swap tested pre-owned phones and laptops." },
+    { name: "FreshFold Laundry", email: "freshfold@knust.edu.gh", location: "Ayeduase New Site", phone: "0244009900", bio: "Wash, dry, fold and ironing — picked up and delivered to your hostel." },
+    { name: "CampusWash", email: "campuswash@knust.edu.gh", location: "Kotei Junction", phone: "0244010010", bio: "Fast student laundry: wash, iron and press, delivered to your door." },
   ].map((p) => ({
     id: randomUUID(),
     passwordHash: hash("password"),
@@ -267,14 +316,18 @@ function seedInMemory() {
     ...p,
   }));
 
-  db.users = [customer, ...providers];
+  db.customers = [customer];
+  db.providers = providers;
 
-  const [prints, courier, tech, shots, beauty] = providers;
+  const [prints, courier, tech, shots, beauty, fix, akosua, swift, flame, nsroma, lens, playzone, glow, tradeup, freshfold, campuswash] = providers;
   // Seed photos are real photographs shipped in server/uploads (see CREDITS.md there).
-  const svc = (providerId, categoryId, title, description, price, media = []) => ({
+  // `serviceType` is the shared label the browse pages group providers under, so
+  // two providers offering "Phone & Laptop Repair" appear together.
+  const svc = (providerId, categoryId, serviceType, title, description, price, media = []) => ({
     id: randomUUID(),
     providerId,
     categoryId,
+    serviceType,
     title,
     description,
     price,
@@ -285,17 +338,35 @@ function seedInMemory() {
   const pics = (...names) => names.map((n) => ({ url: `/uploads/${n}.jpg`, type: "image" }));
 
   db.services = [
-    svc(prints.id, "printing", "Print, Bind & Deliver", "Black/white & colour printing, comb/spiral binding. Delivered to your hall.", 5, pics("seed-print-1", "seed-print-2")),
-    svc(prints.id, "printing", "Photocopy & Past Questions", "Bulk photocopying and past-question packs, same-day delivery.", 3, pics("seed-copy-1", "seed-copy-2")),
-    svc(courier.id, "courier", "Campus Package Pickup & Drop-off", "Send anything across campus in under 30 minutes.", 8, pics("seed-package-1", "seed-package-2")),
-    svc(courier.id, "gas", "Gas (LPG) Cylinder Refill", "We pick up your empty cylinder, refill it in town and return it to your door.", 15, pics("seed-gas-1", "seed-gas-2")),
-    svc(tech.id, "tech", "Website & App Development", "Landing pages, portfolios and small apps for student businesses.", 250, pics("seed-web-1", "seed-web-2")),
-    svc(tech.id, "repairs", "Phone & Laptop Repairs", "Screen and battery replacement, hardware and software fixes in 24-48 hrs.", 50, pics("seed-repair-1", "seed-repair-2")),
-    svc(tech.id, "rentals", "Console & Appliance Rentals", "Rent gaming consoles & pads, irons and electric kettles by the day.", 15, pics("seed-rent-1", "seed-rent-2")),
-    svc(tech.id, "secondhand", "Used Phones & Laptops", "Tested pre-owned phones, laptops and accessories at student prices. Trade-ins welcome.", 50, pics("seed-second-1", "seed-second-2")),
-    svc(shots.id, "creative", "Event & Portrait Photography", "Professional shoots for graduations, birthdays and portfolios. Edited photos in 48 hrs.", 150, pics("seed-creative-1", "seed-creative-2")),
-    svc(shots.id, "event", "DJ & MC Services", "Pro DJ sets and event hosting for hall weeks, parties and socials. Sound system included.", 300, pics("seed-event-1", "seed-event-2")),
-    svc(beauty.id, "beauty", "Braids, Makeup & Nails at Your Room", "Knotless braids, gel nails and event makeup — done right in your hostel.", 60, pics("seed-beauty-1", "seed-beauty-2")),
+    svc(prints.id, "printing", "Print, Bind & Deliver", "Print, Bind & Deliver", "Black/white & colour printing, comb/spiral binding. Delivered to your hall.", 5, pics("seed-print-1", "seed-print-2")),
+    svc(prints.id, "printing", "Photocopy & Past Questions", "Photocopy & Past Questions", "Bulk photocopying and past-question packs, same-day delivery.", 3, pics("seed-copy-1", "seed-copy-2")),
+    svc(courier.id, "courier", "Campus Courier & Delivery", "Campus Package Pickup & Drop-off", "Send anything across campus in under 30 minutes.", 8, pics("seed-package-1", "seed-package-2")),
+    svc(courier.id, "gas", "Gas (LPG) Refill", "Gas (LPG) Cylinder Refill", "We pick up your empty cylinder, refill it in town and return it to your door.", 15, pics("seed-gas-1", "seed-gas-2")),
+    svc(tech.id, "tech", "Website & App Development", "Website & App Development", "Landing pages, portfolios and small apps for student businesses.", 250, pics("seed-web-1", "seed-web-2")),
+    svc(tech.id, "repairs", "Phone & Laptop Repair", "Phone & Laptop Repairs", "Screen and battery replacement, hardware and software fixes in 24-48 hrs.", 50, pics("seed-repair-1", "seed-repair-2")),
+    svc(tech.id, "rentals", "Console & Appliance Rentals", "Console & Appliance Rentals", "Rent gaming consoles & pads, irons and electric kettles by the day.", 15, pics("seed-rent-1", "seed-rent-2")),
+    svc(tech.id, "secondhand", "Used Phones & Laptops", "Used Phones & Laptops", "Tested pre-owned phones, laptops and accessories at student prices. Trade-ins welcome.", 50, pics("seed-second-1", "seed-second-2")),
+    svc(shots.id, "creative", "Event & Portrait Photography", "Event & Portrait Photography", "Professional shoots for graduations, birthdays and portfolios. Edited photos in 48 hrs.", 150, pics("seed-creative-1", "seed-creative-2")),
+    svc(shots.id, "event", "DJ & MC Services", "DJ & MC Services", "Pro DJ sets and event hosting for hall weeks, parties and socials. Sound system included.", 300, pics("seed-event-1", "seed-event-2")),
+    svc(beauty.id, "beauty", "Braids, Makeup & Nails", "Braids, Makeup & Nails at Your Room", "Knotless braids, gel nails and event makeup — done right in your hostel.", 60, pics("seed-beauty-1", "seed-beauty-2")),
+    // Second provider under an existing service type so grouping is visible.
+    svc(fix.id, "repairs", "Phone & Laptop Repair", "Screen & Battery Replacement", "Cracked screens and dead batteries fixed same-day, plus water-damage recovery.", 45, pics("seed-repair-1", "seed-repair-2")),
+    // More providers competing on the same services, so customers pick who they prefer.
+    svc(akosua.id, "printing", "Print, Bind & Deliver", "Colour Print, Laminate & Bind", "Colour printing, lamination and hard/soft binding for theses and reports.", 6, pics("seed-print-2", "seed-print-1")),
+    svc(akosua.id, "printing", "Photocopy & Past Questions", "Past Questions & Handouts", "Past-question packs and lecture handouts photocopied and delivered.", 3, pics("seed-copy-2", "seed-copy-1")),
+    svc(swift.id, "courier", "Campus Courier & Delivery", "Anywhere-on-Campus Courier", "Fast pickups and deliveries between halls, gates and lecture blocks.", 7, pics("seed-package-2", "seed-package-1")),
+    svc(flame.id, "gas", "Gas (LPG) Refill", "LPG Cylinder Pickup & Refill", "Empty cylinder collected, refilled in town and returned to your door.", 14, pics("seed-gas-2", "seed-gas-1")),
+    svc(nsroma.id, "tech", "Website & App Development", "Websites & Mobile Apps", "Custom sites and simple mobile apps built for student businesses.", 220, pics("seed-web-2", "seed-web-1")),
+    svc(lens.id, "creative", "Event & Portrait Photography", "Portrait & Event Shoots", "Graduation, birthday and portfolio shoots with edited photos in 48 hrs.", 130, pics("seed-creative-2", "seed-creative-1")),
+    svc(lens.id, "event", "DJ & MC Services", "DJ & Event Hosting", "DJ sets and MC hosting for hall weeks, parties and socials.", 280, pics("seed-event-2", "seed-event-1")),
+    svc(playzone.id, "rentals", "Console & Appliance Rentals", "Console & Projector Rentals", "PS5/PS4 consoles, extra pads, projectors and kettles by the day.", 18, pics("seed-rent-2", "seed-rent-1")),
+    svc(glow.id, "beauty", "Braids, Makeup & Nails", "Nails, Braids & Glam Makeup", "Gel nails, knotless braids and event makeup in the comfort of your room.", 55, pics("seed-beauty-2", "seed-beauty-1")),
+    svc(tradeup.id, "secondhand", "Used Phones & Laptops", "Pre-owned Phones & Laptops", "Tested second-hand phones and laptops, with trade-ins welcome.", 45, pics("seed-second-2", "seed-second-1")),
+    // Laundry providers — two competing on "Wash, Dry & Fold", each also offering another listed service.
+    svc(freshfold.id, "laundry", "Wash, Dry & Fold", "Wash, Dry & Fold", "Same-day wash, dry and fold. We pick up and deliver to your hostel.", 20, pics("seed-rent-1", "seed-rent-2")),
+    svc(freshfold.id, "courier", "Campus Courier & Delivery", "Laundry & Parcel Pickup", "Pickups and drop-offs anywhere on campus, laundry or parcels.", 7, pics("seed-package-1", "seed-package-2")),
+    svc(campuswash.id, "laundry", "Wash, Dry & Fold", "Wash, Iron & Press", "Wash, iron and press for shirts, dresses and bedding. Delivered to your door.", 18, pics("seed-rent-2", "seed-rent-1")),
+    svc(campuswash.id, "rentals", "Console & Appliance Rentals", "Iron & Steamer Rentals", "Rent a steam iron or garment steamer by the day.", 10, pics("seed-rent-1", "seed-rent-2")),
   ];
 
   // A few sample reviews so the star ratings aren't empty on a fresh install.
@@ -310,13 +381,63 @@ function seedInMemory() {
     comment,
     createdAt: Date.now() - daysAgo * 86400000,
   });
-  const [print1, , package1, , webDev] = db.services;
+  // Reference seeded services by position (see the db.services array above).
+  const S = db.services;
+  const [print1, , package1, gasRefill, webDev, phoneRepair, rental1, used1,
+    kojoPhoto, kojoDj, esiBeauty, kofiRepair, akosuaPrint, , swiftCourier,
+    flameGas, nsromaWeb, lensPhoto, lensDj, playRental, glowBeauty, tradeUsed,
+    freshLaundry, , washLaundry] = S;
   db.reviews = [
     review(print1, "Ama B.", 5, "Super fast — delivered to my hall in 20 minutes. 🔥", 2),
     review(print1, "Kofi M.", 4, "Good quality binding, slightly late but worth it.", 8),
     review(print1, "Esi A.", 5, "Reliable, will order again.", 16),
     review(package1, "Yaw D.", 4, "Package got across campus safely. Smooth handoff.", 5),
+    review(gasRefill, "Abena L.", 5, "Picked up my cylinder and returned it refilled the same day.", 9),
     review(webDev, "Nana K.", 5, "Built my hall-week site in two days. Clean work.", 11),
+    review(phoneRepair, "Kwabena O.", 5, "Cracked screen fixed in a few hours. Works like new.", 6),
+    review(rental1, "Adwoa F.", 4, "Console was clean and worked perfectly. Smooth rental.", 13),
+    review(used1, "Kojo T.", 5, "Phone was well-tested and exactly as described.", 20),
+    // Kojo Shots
+    review(kojoPhoto, "Efua N.", 5, "Amazing shots — edited photos came within 48 hours.", 4),
+    review(kojoPhoto, "Kwame P.", 5, "Made my graduation shoot so much fun. Recommend.", 18),
+    review(kojoDj, "Yaw D.", 4, "Kept hall week alive all night. Great energy.", 10),
+    // Esi Beauty Hub
+    review(esiBeauty, "Akua S.", 5, "Neat braids done right in my room. Loved it.", 7),
+    review(esiBeauty, "Ama B.", 4, "Nails came out great and lasted for weeks.", 21),
+    // Kofi Fix
+    review(kofiRepair, "Kofi M.", 5, "Fixed my battery same day. Honest pricing.", 5),
+    review(kofiRepair, "Nana K.", 4, "Quick water-damage recovery — got my phone back working.", 15),
+    // Akosua Printworks
+    review(akosuaPrint, "Esi A.", 5, "Clean colour prints and solid binding for my thesis.", 6),
+    review(akosuaPrint, "Adwoa F.", 4, "Sorted my handouts overnight. Very handy.", 17),
+    // Swift Campus Errands
+    review(swiftCourier, "Kwabena O.", 5, "Fast pickup and drop-off across campus.", 3),
+    review(swiftCourier, "Abena L.", 5, "Found me at the library easily. Smooth handoff.", 12),
+    // FlameGas Express
+    review(flameGas, "Kojo T.", 5, "Refilled my cylinder the same day. No stress.", 8),
+    review(flameGas, "Efua N.", 4, "Saved me the trip to town. Fair price.", 19),
+    // Nsroma Web Studio
+    review(nsromaWeb, "Kwame P.", 5, "Built my portfolio site — clean, professional work.", 9),
+    review(nsromaWeb, "Ama B.", 4, "Great communication and delivered on time.", 22),
+    // Lens & Light Studio
+    review(lensPhoto, "Akua S.", 5, "Beautiful portraits with quick edits.", 6),
+    review(lensDj, "Yaw D.", 4, "Great MC — read the crowd well all night.", 14),
+    // PlayZone Rentals
+    review(playRental, "Adwoa F.", 5, "Console and projector were spotless. Easy pickup.", 5),
+    review(playRental, "Kofi M.", 4, "Fair daily rate and everything worked.", 16),
+    // Glow Beauty Bar
+    review(glowBeauty, "Efua N.", 5, "Flawless makeup for my event — lasted all day.", 4),
+    review(glowBeauty, "Esi A.", 4, "Braids and nails on point, done in my room.", 18),
+    // TradeUp KNUST
+    review(tradeUsed, "Kwabena O.", 5, "Laptop exactly as described and well tested.", 7),
+    review(tradeUsed, "Nana K.", 4, "Smooth trade-in, no surprises.", 20),
+    // FreshFold Laundry
+    review(freshLaundry, "Adwoa F.", 5, "Clothes came back clean, folded and smelling great.", 4),
+    review(freshLaundry, "Kojo T.", 5, "Picked up from my hostel and delivered next day. So convenient.", 12),
+    review(freshLaundry, "Ama B.", 4, "Neat ironing, nothing shrank. Will use again.", 19),
+    // CampusWash
+    review(washLaundry, "Efua N.", 5, "Fast turnaround and my shirts were perfectly pressed.", 6),
+    review(washLaundry, "Kwabena O.", 4, "Good price and delivered right to my door on time.", 14),
   ];
 }
 
@@ -340,21 +461,26 @@ export const Categories = {
 };
 
 export const Users = {
-  all: () => clone(db.users),
-  find: (fn) => clone(db.users.find(fn) || null),
-  byId: (id) => clone(db.users.find((u) => u.id === id) || null),
+  all: () => clone(allUsers()),
+  find: (fn) => clone(allUsers().find(fn) || null),
+  byId: (id) => clone(allUsers().find((u) => u.id === id) || null),
+  // A user's collection is decided by role (providers vs customers).
   create: (data) => {
     const user = { id: randomUUID(), createdAt: Date.now(), ...data };
-    db.users.push(user);
-    saveRow("users", user);
+    const coll = userTable(user.role);
+    db[coll].push(user);
+    saveRow(coll, user);
     return clone(user);
   },
   update: (id, patch) => {
-    const u = db.users.find((x) => x.id === id);
-    if (!u) return null;
-    Object.assign(u, patch);
-    saveRow("users", u);
-    return clone(u);
+    for (const coll of ["providers", "customers"]) {
+      const u = db[coll].find((x) => x.id === id);
+      if (!u) continue;
+      Object.assign(u, patch);
+      saveRow(coll, u);
+      return clone(u);
+    }
+    return null;
   },
 };
 

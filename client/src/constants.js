@@ -11,4 +11,5 @@ export const CATEGORY_ICONS = {
   courier: "📦",
   event: "🎉",
   beauty: "💇",
+  laundry: "🧺",
 };

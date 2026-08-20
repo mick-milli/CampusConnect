@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth.jsx";
+import { api } from "../api.js";
 
 export default function Register() {
   const { register } = useAuth();
@@ -15,6 +16,10 @@ export default function Register() {
   });
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // Set to the email address once signup needs confirmation, which swaps the
+  // form out for the "check your inbox" screen.
+  const [pending, setPending] = useState("");
+  const [resent, setResent] = useState(false);
 
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
@@ -23,14 +28,64 @@ export default function Register() {
     setError("");
     setBusy(true);
     try {
-      const user = await register(form);
-      navigate(user.role === "provider" ? "/dashboard" : "/services");
+      const res = await register(form);
+      if (res.pending) {
+        setPending(res.email);
+        return;
+      }
+      navigate(res.user.role === "provider" ? "/dashboard" : "/services");
     } catch (err) {
       setError(err.message);
     } finally {
       setBusy(false);
     }
   };
+
+  const resend = async () => {
+    setError("");
+    try {
+      await api.post("/auth/resend", { email: pending });
+      setResent(true);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  if (pending) {
+    return (
+      <div className="center-narrow">
+        <div className="card" style={{ padding: 28 }}>
+          <h1 style={{ marginTop: 0 }}>Confirm your email</h1>
+          <p className="muted">
+            We sent a confirmation link to <strong>{pending}</strong>. Click it to activate your
+            account, then log in.
+          </p>
+          {error && <div className="error">{error}</div>}
+          {resent ? (
+            <p className="muted">Sent again — check your inbox (and spam folder).</p>
+          ) : (
+            <p className="muted">
+              Didn't get it?{" "}
+              <button
+                type="button"
+                className="linkish-plain"
+                style={{ color: "var(--green)" }}
+                onClick={resend}
+              >
+                Resend the link
+              </button>
+              .
+            </p>
+          )}
+          <p className="muted" style={{ marginTop: 16 }}>
+            <Link to="/login" style={{ color: "var(--green)", fontWeight: 700 }}>
+              Back to log in
+            </Link>
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="center-narrow">

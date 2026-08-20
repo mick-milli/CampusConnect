@@ -44,7 +44,24 @@ export function AuthProvider({ children }) {
     return applySession(res);
   };
 
-  const register = async (payload) => applySession(await api.post("/auth/register", payload));
+  // Returns { pending: true, email } when the account needs email confirmation
+  // before it can sign in; otherwise signs the user straight in.
+  const register = async (payload) => {
+    const res = await api.post("/auth/register", payload);
+    if (res.pending) return { pending: true, email: res.email };
+    applySession(res);
+    return { user: res.user };
+  };
+
+  // Adopt tokens delivered out-of-band (the email-confirmation redirect hands
+  // them to us in the URL hash) and load the freshly-confirmed profile.
+  const sessionFromTokens = async ({ token, refreshToken }) => {
+    setToken(token);
+    if (refreshToken) setRefreshToken(refreshToken);
+    const { user } = await api.get("/auth/me");
+    setUser(user);
+    return user;
+  };
 
   const logout = () => {
     clearToken();
@@ -56,7 +73,7 @@ export function AuthProvider({ children }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, completeMfa, register, logout, updateUser }}
+      value={{ user, loading, login, completeMfa, register, sessionFromTokens, logout, updateUser }}
     >
       {children}
     </AuthContext.Provider>
