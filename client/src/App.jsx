@@ -13,9 +13,11 @@ import MainMenu from "./components/MainMenu.jsx";
 import Landing from "./pages/Landing.jsx";
 import Home from "./pages/Home.jsx";
 import CategoryServices from "./pages/CategoryServices.jsx";
+import ProviderStore from "./pages/ProviderStore.jsx";
 import ServiceDetail from "./pages/ServiceDetail.jsx";
 import Login from "./pages/Login.jsx";
 import Register from "./pages/Register.jsx";
+import Confirm from "./pages/Confirm.jsx";
 import Orders from "./pages/Orders.jsx";
 import ProviderDashboard from "./pages/ProviderDashboard.jsx";
 import Notifications from "./pages/Notifications.jsx";
@@ -116,8 +118,12 @@ export default function App() {
                 </Protected>
               }
             />
+            {/* Public: guests from the landing page can browse a storefront. */}
+            <Route path="/providers/:id" element={<ProviderStore />} />
             <Route path="/login" element={<Login />} />
             <Route path="/register" element={<Register />} />
+            {/* Landing spot for the signup confirmation email link. */}
+            <Route path="/auth/confirm" element={<Confirm />} />
             <Route
               path="/orders"
               element={

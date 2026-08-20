@@ -8,7 +8,11 @@
 -- never read these tables directly.
 
 create table if not exists cc_categories    (id text primary key, data jsonb not null);
+-- Users are split by role. cc_users is the legacy pre-split table: it's kept as
+-- a backup and auto-migrated into the two below on first start after upgrading.
 create table if not exists cc_users         (id text primary key, data jsonb not null);
+create table if not exists cc_providers     (id text primary key, data jsonb not null);
+create table if not exists cc_customers     (id text primary key, data jsonb not null);
 create table if not exists cc_services      (id text primary key, data jsonb not null);
 create table if not exists cc_orders        (id text primary key, data jsonb not null);
 create table if not exists cc_reviews       (id text primary key, data jsonb not null);
@@ -18,6 +22,8 @@ create table if not exists cc_messages      (id text primary key, data jsonb not
 -- Lock the tables down to the service role only.
 alter table cc_categories    enable row level security;
 alter table cc_users         enable row level security;
+alter table cc_providers     enable row level security;
+alter table cc_customers     enable row level security;
 alter table cc_services      enable row level security;
 alter table cc_orders        enable row level security;
 alter table cc_reviews       enable row level security;

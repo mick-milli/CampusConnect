@@ -29,6 +29,19 @@ const PAYABLE_STATUSES = ["accepted", "in_progress", "out_for_delivery", "delive
 const WORK_STEPS = ["in_progress", "out_for_delivery", "delivered"];
 const isOnline = (pay) => pay?.method === "momo" || pay?.method === "card";
 
+const pct = (r) => `${Math.round((r || 0) * 100)}%`;
+// Gross/fee/net for a payment. `fee`/`net` are locked in by the server at
+// release; before that we estimate them from the current platform fee rate.
+const feeSplit = (pay, feeRate) => {
+  const gross = pay?.amount ?? 0;
+  const fee = pay?.fee ?? Math.round(gross * (feeRate || 0) * 100) / 100;
+  const net = pay?.net ?? Math.round((gross - fee) * 100) / 100;
+  return { gross, fee, net };
+};
+// Reads as "still moving" while Paystack settles the refund, else past tense.
+const refundVerb = (pay) =>
+  ["pending", "processing"].includes(pay?.refund?.status) ? "is being refunded to" : "was refunded to";
+
 // Pay entry point. With Paystack live, the customer picks a method and is sent
 // to Paystack's secure checkout (card/MoMo details are entered there). Without
 // keys configured, the same button simulates the charge for local dev.
@@ -99,12 +112,13 @@ const PAYOUT_VIEW = {
 };
 
 // Provider-only payout status shown once an order's escrow is released.
-function ProviderPayout({ order, onUpdate }) {
+function ProviderPayout({ order, onUpdate, feeRate }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const payout = order.payout || { status: "pending" };
   const view = PAYOUT_VIEW[payout.status] || PAYOUT_VIEW.pending;
   const canRetry = ["awaiting_details", "failed"].includes(payout.status);
+  const { net } = feeSplit(order.payment, feeRate);
 
   const retry = async () => {
     setBusy(true);
@@ -123,7 +137,7 @@ function ProviderPayout({ order, onUpdate }) {
     <div>
       <p className="pay-note muted">
         {view.icon} {view.text}
-        {payout.status === "paid" ? ` — ${cedis(order.payment?.amount)}` : ""}
+        {payout.status === "paid" ? ` — ${cedis(net)}` : ""}
       </p>
       {canRetry && (
         <div className="row" style={{ marginTop: 6 }}>
@@ -141,13 +155,14 @@ function ProviderPayout({ order, onUpdate }) {
 }
 
 // Escrow status + (for the customer) the pay entry point. Cash orders skip this.
-function PaymentSection({ order, role, onUpdate, paystackEnabled }) {
+function PaymentSection({ order, role, onUpdate, paystackEnabled, feeRate }) {
   const pay = order.payment || {};
   if (!isOnline(pay)) return null;
 
   const badge = PAY_BADGE[pay.status] || PAY_BADGE.unpaid;
   const canPay =
     role === "customer" && pay.status === "unpaid" && PAYABLE_STATUSES.includes(order.status);
+  const { fee, net } = feeSplit(pay, feeRate);
 
   return (
     <div className="pay-section">
@@ -167,18 +182,31 @@ function PaymentSection({ order, role, onUpdate, paystackEnabled }) {
       {pay.status === "in_escrow" && (
         <p className="pay-note muted">
           {role === "provider"
-            ? `✅ ${cedis(pay.amount)} secured in escrow — safe to start. You receive it when the customer confirms completion.`
+            ? `✅ ${cedis(pay.amount)} secured in escrow — safe to start. After the ${pct(feeRate)} platform fee (${cedis(fee)}) you'll receive ${cedis(net)} once the customer confirms completion.`
             : `✅ ${cedis(pay.amount)} held in escrow. Released to the provider when you confirm the work is done.`}
+        </p>
+      )}
+      {/* Provider terms, shown before/while they work so it's never a surprise. */}
+      {role === "provider" && ["unpaid", "in_escrow"].includes(pay.status) && (
+        <p className="pay-note muted" style={{ fontSize: 12 }}>
+          ℹ️ Terms: a {pct(feeRate)} platform fee is deducted on completion. If work is left
+          uncompleted, the customer can flag the order — after raising it with you in chat — for a
+          full refund. Keep what you agree in the order chat; it's the record.
         </p>
       )}
       {pay.status === "released" &&
         (role === "provider" ? (
-          <ProviderPayout order={order} onUpdate={onUpdate} />
+          <ProviderPayout order={order} onUpdate={onUpdate} feeRate={feeRate} />
         ) : (
           <p className="pay-note muted">Payment released to the provider. Thanks!</p>
         ))}
       {pay.status === "refunded" && (
-        <p className="pay-note muted">{cedis(pay.amount)} was refunded to the customer.</p>
+        <p className="pay-note muted">
+          {order.flag
+            ? `⚑ Flagged as uncompleted work — ${cedis(pay.amount)} ${refundVerb(pay)} the customer in full.`
+            : `${cedis(pay.amount)} ${refundVerb(pay)} the customer.`}
+          {order.flag?.reason ? ` Reason: “${order.flag.reason}”` : ""}
+        </p>
       )}
     </div>
   );
@@ -253,7 +281,7 @@ function ReviewForm({ order, onReviewed }) {
   );
 }
 
-function OrderCard({ order, role, me, onUpdate, onRemove, onReviewed, paystackEnabled }) {
+function OrderCard({ order, role, me, onUpdate, onRemove, onReviewed, paystackEnabled, feeRate }) {
   const [busy, setBusy] = useState(false);
   const other = role === "provider" ? order.customer : order.provider;
   const otherName = other?.name;
@@ -262,6 +290,31 @@ function OrderCard({ order, role, me, onUpdate, onRemove, onReviewed, paystackEn
     setBusy(true);
     try {
       const updated = await api.patch(`/orders/${order.id}/status`, { status });
+      onUpdate(updated);
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Flag the order for uncompleted work → full refund. The server only allows
+  // this once the customer has raised it in chat and the provider has replied
+  // (or gone quiet past the grace window) — see order.flagState.
+  const flag = async () => {
+    const reason = window.prompt(
+      "Briefly, what was left uncompleted? (optional — this is shared with the provider)"
+    );
+    if (reason === null) return; // dismissed the prompt
+    if (
+      !window.confirm(
+        "Flag this order as uncompleted? You'll be refunded in full and the order will close."
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const updated = await api.post(`/orders/${order.id}/flag`, { reason });
       onUpdate(updated);
     } catch (e) {
       alert(e.message);
@@ -290,6 +343,10 @@ function OrderCard({ order, role, me, onUpdate, onRemove, onReviewed, paystackEn
   if (escrowBlocked) nextSteps = nextSteps.filter((s) => !WORK_STEPS.includes(s));
   const customerCanCancel = role === "customer" && ["requested", "accepted"].includes(order.status);
   const customerCanComplete = role === "customer" && order.status === "delivered";
+  // The server decides whether/why the customer can flag right now: "eligible"
+  // shows the button; "raise"/"wait" show a nudge to talk to the provider first.
+  const flagStage = role === "customer" ? order.flagState?.stage : null;
+  const customerCanFlag = flagStage === "eligible";
 
   return (
     <div className="card" style={{ padding: 18 }}>
@@ -349,9 +406,10 @@ function OrderCard({ order, role, me, onUpdate, onRemove, onReviewed, paystackEn
         role={role}
         onUpdate={onUpdate}
         paystackEnabled={paystackEnabled}
+        feeRate={feeRate}
       />
 
-      {(nextSteps.length > 0 || customerCanCancel || customerCanComplete) && (
+      {(nextSteps.length > 0 || customerCanCancel || customerCanComplete || customerCanFlag) && (
         <div className="row" style={{ marginTop: 14 }}>
           {nextSteps.map((s) => (
             <button
@@ -368,12 +426,33 @@ function OrderCard({ order, role, me, onUpdate, onRemove, onReviewed, paystackEn
               Confirm received
             </button>
           )}
+          {customerCanFlag && (
+            <button className="btn sm danger" disabled={busy} onClick={flag}>
+              ⚑ Flag uncompleted work
+            </button>
+          )}
           {customerCanCancel && (
             <button className="btn sm danger" disabled={busy} onClick={() => update("cancelled")}>
               Cancel order
             </button>
           )}
         </div>
+      )}
+
+      {flagStage === "raise" && (
+        <p className="pay-note muted" style={{ marginTop: 8, fontSize: 12 }}>
+          Not what you agreed? Message the provider in the chat below to raise it — once they reply,
+          or if there's no response within 24 hours, you'll be able to flag the order for a full refund.
+        </p>
+      )}
+      {flagStage === "wait" && (
+        <p className="pay-note muted" style={{ marginTop: 8, fontSize: 12 }}>
+          You've raised this with the provider. If it's still unresolved you can flag for a full refund
+          {order.flagState?.until
+            ? ` after ${new Date(order.flagState.until).toLocaleString()}`
+            : " once they've had 24 hours to respond"}
+          .
+        </p>
       )}
 
       {order.status === "cancelled" && (
@@ -418,6 +497,7 @@ export default function Orders() {
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [paystackEnabled, setPaystackEnabled] = useState(false);
+  const [feeRate, setFeeRate] = useState(0);
   const [payMsg, setPayMsg] = useState("");
 
   useEffect(() => {
@@ -425,7 +505,13 @@ export default function Orders() {
       .get("/orders")
       .then(setOrders)
       .finally(() => setLoading(false));
-    api.get("/config").then((c) => setPaystackEnabled(!!c.paystackEnabled)).catch(() => {});
+    api
+      .get("/config")
+      .then((c) => {
+        setPaystackEnabled(!!c.paystackEnabled);
+        setFeeRate(c.platformFeeRate || 0);
+      })
+      .catch(() => {});
     // Refresh in the background so status changes and unread badges show up.
     const t = setInterval(() => api.get("/orders").then(setOrders).catch(() => {}), 15000);
     return () => clearInterval(t);
@@ -486,6 +572,7 @@ export default function Orders() {
               onRemove={onRemove}
               onReviewed={onReviewed}
               paystackEnabled={paystackEnabled}
+              feeRate={feeRate}
             />
           ))}
         </div>

@@ -5,7 +5,7 @@ import { useNotifications } from "../notifications.jsx";
 import { Avatar } from "./common.jsx";
 
 // Single menu button that houses every feature for both roles:
-//   Browse / Dashboard · My Orders · Notifications
+//   My Orders · Earnings & payouts ▸ Payout details (providers) · Notifications
 //   Settings ▸ Account ▸ Your Profile / Log out
 export default function MainMenu() {
   const { user, logout } = useAuth();
@@ -67,9 +67,14 @@ export default function MainMenu() {
               📦 My Orders
             </button>
             {user.role === "provider" && (
-              <button className="menu-item" onClick={() => go("/earnings")}>
-                💰 Earnings &amp; payouts
-              </button>
+              <>
+                <button className="menu-item" onClick={() => go("/earnings")}>
+                  💰 Earnings &amp; payouts
+                </button>
+                <button className="menu-item menu-sub" onClick={() => go("/settings/payout")}>
+                  💸 Payout details
+                </button>
+              </>
             )}
             <button className="menu-item" onClick={() => go("/notifications")}>
               🔔 Notifications

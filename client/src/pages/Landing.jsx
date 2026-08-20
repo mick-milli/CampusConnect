@@ -1,19 +1,5 @@
 import { Link, useNavigate } from "react-router-dom";
-
-// Static copy of the seeded marketplace categories so the landing page
-// renders instantly and offline. Providers can add more once signed up.
-const CATEGORIES = [
-  { id: "printing", name: "Printing", icon: "🖨️", blurb: "Print, copy & bind — delivered" },
-  { id: "gas", name: "Gas (LPG) Refill", icon: "🔥", blurb: "Cylinder pickup, refill & return" },
-  { id: "repairs", name: "Phone & Laptop Repairs", icon: "🛠️", blurb: "Screens, batteries & software fixes" },
-  { id: "rentals", name: "Item & Gadget Rentals", icon: "🧰", blurb: "Gaming consoles & pads, irons, electric kettles & more" },
-  { id: "secondhand", name: "Secondhand Buy & Sell", icon: "♻️", blurb: "Pre-owned books, gadgets & essentials" },
-  { id: "tech", name: "Tech & Digital", icon: "💻", blurb: "Dev, design & IT support" },
-  { id: "creative", name: "Creative & Media", icon: "📸", blurb: "Photo, video & editing" },
-  { id: "courier", name: "Courier & Delivery", icon: "📦", blurb: "Campus-wide pickup & drop-off" },
-  { id: "event", name: "Event-Based", icon: "🎉", blurb: "Planning, décor, MCs & DJs" },
-  { id: "beauty", name: "Personal & Beauty", icon: "💇", blurb: "Hair, makeup & nails at home" },
-];
+import ProviderBrowser from "../components/ProviderBrowser.jsx";
 
 const STEPS = [
   {
@@ -114,38 +100,13 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* ---- categories ---- */}
+      {/* ---- providers on campus ---- */}
       <section className="landing-section">
-        <div className="spread">
-          <div>
-            <h2 className="section-title" style={{ margin: 0 }}>
-              Whatever you need, someone on campus does it
-            </h2>
-            <p className="muted" style={{ margin: "6px 0 0" }}>
-              Create a free account to browse listings and order from any category.
-            </p>
-          </div>
-        </div>
-        <div className="cat-grid">
-          {CATEGORIES.map((c) => (
-            <Link key={c.id} to="/register" className="card cat-tile">
-              <span className="cat-icon">{c.icon}</span>
-              <strong>{c.name}</strong>
-              <span className="muted">{c.blurb}</span>
-              <img
-                className="cat-photo"
-                src={`/images/categories/${c.id}.jpg`}
-                alt={c.name}
-                loading="lazy"
-              />
-            </Link>
-          ))}
-          <Link to="/register" className="card cat-tile more">
-            <span className="cat-icon">✨</span>
-            <strong>Something else?</strong>
-            <span className="muted">Providers can list any service they offer</span>
-          </Link>
-        </div>
+        <ProviderBrowser
+          title="Providers on campus"
+          subtitle="Real students & staff running campus businesses — pick a service, then choose the provider you prefer."
+          showSearch={false}
+        />
       </section>
 
       {/* ---- how it works ---- */}

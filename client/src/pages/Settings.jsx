@@ -25,14 +25,6 @@ export default function Settings() {
             ›
           </span>
         </button>
-        {user.role === "provider" && (
-          <button className="settings-link" onClick={() => navigate("/settings/payout")}>
-            <span>💸 Payout details</span>
-            <span className="chev" aria-hidden>
-              ›
-            </span>
-          </button>
-        )}
       </div>
 
       <div className="card settings-card">

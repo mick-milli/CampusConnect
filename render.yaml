@@ -1,0 +1,25 @@
+# Render Blueprint — one free web service that builds the React client and runs
+# the Node API, which serves both the API and the built frontend.
+# Deploy: push to GitHub → Render dashboard → New → Blueprint → pick this repo.
+services:
+  - type: web
+    name: campusconnect
+    runtime: node
+    plan: free
+    buildCommand: npm run install:all && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # Secrets — set these in the Render dashboard (Environment tab), not here.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      # After the first deploy, set this to your live URL, e.g.
+      # https://campusconnect.onrender.com (used for email-confirmation links).
+      - key: CLIENT_URL
+        sync: false
