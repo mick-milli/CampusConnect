@@ -189,10 +189,12 @@ export default function ProviderDashboard() {
         <strong>How payouts work</strong>
         <p className="muted" style={{ fontSize: 13, margin: "6px 0 0" }}>
           Online payments are held in escrow until the customer confirms the work — then you're paid
-          out. You keep <strong>95%</strong>; a 5% platform fee applies to each completed order. If
-          work is left uncompleted, a customer can raise it with you in the order chat and, if it
-          stays unresolved, flag the order for a full refund. Keep every agreement in the chat — it's
-          your record.
+          out. You keep <strong>95%</strong>; a 5% platform fee applies to each completed order. Once
+          an order is funded it can't be cancelled, so deliver within 24 hours — otherwise the money
+          is automatically refunded to the customer. Once you've delivered, that deadline stops and
+          it's on the customer to confirm. If work is left uncompleted, a customer can also raise it
+          with you in the order chat and, if it stays unresolved, flag the order for a full refund.
+          Keep every agreement in the chat — it's your record.
         </p>
       </div>
 

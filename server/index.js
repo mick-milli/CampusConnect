@@ -79,6 +79,13 @@ const feeBreakdown = (amount) => {
 const PAY_METHODS = ["cash", "momo", "card"];
 const ONLINE_METHODS = ["momo", "card"];
 
+// Once an order is funded it's locked in: neither party can cancel it. The
+// provider must get the work delivered within this window, or the escrowed funds
+// are automatically refunded to the customer (see sweepExpiredEscrow). Once it's
+// delivered the clock stops — it's then on the customer to confirm or flag it —
+// so a provider who did the work isn't refunded out from under them.
+const ESCROW_DEADLINE_MS = Number(process.env.ESCROW_DEADLINE_MS) || 24 * 60 * 60 * 1000;
+
 // A fresh order's payment record. Online orders start "unpaid" and are funded
 // into escrow after the provider accepts; cash orders are paid on delivery.
 function newPayment(method, amount) {
@@ -818,7 +825,10 @@ app.post("/api/orders", auth(), requireRole("customer"), (req, res) => {
   res.status(201).json(decorateOrder(order, req.user.id));
 });
 
-app.get("/api/orders", auth(), (req, res) => {
+app.get("/api/orders", auth(), async (req, res) => {
+  // Settle any overdue escrow before listing, so refunds show up promptly for
+  // whoever's looking (the interval sweep is the backstop when nobody is).
+  await sweepExpiredEscrow().catch(() => {});
   const key = req.user.role === "provider" ? "providerId" : "customerId";
   const list = Orders.filter((o) => o[key] === req.user.id).sort((a, b) => b.createdAt - a.createdAt);
   res.json(list.map((o) => decorateOrder(o, req.user.id)));
@@ -856,6 +866,15 @@ app.patch("/api/orders/:id/status", auth(), async (req, res) => {
   const isCustomer = o.customerId === req.user.id;
   if (!isProvider && !isCustomer) return res.status(403).json({ error: "Not your order" });
 
+  // Once money is in escrow the order is locked in — neither party can cancel it
+  // (no cancelling just to trigger a refund). If it isn't completed in time,
+  // sweepExpiredEscrow refunds the customer automatically (see ESCROW_DEADLINE_MS).
+  if (status === "cancelled" && o.payment?.status === "in_escrow")
+    return res.status(409).json({
+      error:
+        "This order is funded and can no longer be cancelled. If the provider doesn't deliver within 24 hours, the money in escrow is refunded to the customer automatically.",
+    });
+
   // Customers may only cancel (before delivery) or mark completed once delivered.
   if (isCustomer && !isProvider) {
     if (status === "cancelled" && ["requested", "accepted"].includes(o.status)) {
@@ -882,19 +901,16 @@ app.patch("/api/orders/:id/status", auth(), async (req, res) => {
     history: [...(o.history || []), { status, at: Date.now() }],
   };
   // Release escrowed funds to the provider once the customer confirms the work
-  // is done; refund them if a funded order is cancelled. On release we lock in
-  // the platform fee and the net the provider is owed.
-  if (o.payment?.status === "in_escrow") {
-    if (status === "completed")
-      patch.payment = {
-        ...o.payment,
-        status: "released",
-        releasedAt: Date.now(),
-        ...feeBreakdown(o.payment.amount),
-      };
-    else if (status === "cancelled")
-      patch.payment = { ...o.payment, status: "refunded" };
-  }
+  // is done, locking in the platform fee and the net the provider is owed. A
+  // funded order can't be cancelled here — an unfinished one is auto-refunded by
+  // sweepExpiredEscrow — so there's no cancel-refund path in this handler.
+  if (o.payment?.status === "in_escrow" && status === "completed")
+    patch.payment = {
+      ...o.payment,
+      status: "released",
+      releasedAt: Date.now(),
+      ...feeBreakdown(o.payment.amount),
+    };
   let updated = Orders.update(o.id, patch);
 
   // Tell the other party their order moved.
@@ -907,15 +923,10 @@ app.patch("/api/orders/:id/status", auth(), async (req, res) => {
       : `Order "${service?.title || "service"}" is now ${label}`;
   notify(recipientId, "status", text, o.id);
 
-  // On release, pay the provider out via Transfers; on refund, reverse the
-  // customer's escrow charge (refundEscrow notifies them).
+  // On release, pay the provider out via Transfers.
   if (patch.payment?.status === "released") {
     await payProvider(updated);
     updated = Orders.byId(o.id); // pick up the payout state payProvider wrote
-  }
-  if (patch.payment?.status === "refunded") {
-    await refundEscrow(updated);
-    updated = Orders.byId(o.id);
   }
 
   res.json(decorateOrder(updated, req.user.id));
@@ -1010,6 +1021,55 @@ async function refundEscrow(o) {
     setRefund({ status: "failed", error: e.message });
     notify(o.customerId, "payment", `We couldn't process your ${money(amount)} refund automatically — support will sort it out.`, o.id);
     console.error(`Paystack refund for order ${o.id}: ${e.message}`);
+  }
+}
+
+// Auto-refund any funded order the provider hasn't delivered within the escrow
+// deadline (24h from when the money landed in escrow). Since a funded order can't
+// be cancelled, this is the customer's guarantee: no delivery in time → money
+// comes back. Delivered orders are excluded — the provider has done their part,
+// so it's on the customer to confirm or flag it, not for us to refund it away.
+// Runs on an interval, at startup, and lazily when orders are listed.
+// Non-reentrant so overlapping calls (interval + a request) can't double-refund.
+let sweepingEscrow = false;
+async function sweepExpiredEscrow() {
+  if (sweepingEscrow) return;
+  sweepingEscrow = true;
+  try {
+    const now = Date.now();
+    const due = Orders.filter(
+      (o) =>
+        o.payment?.status === "in_escrow" &&
+        !["completed", "cancelled", "delivered"].includes(o.status) &&
+        o.payment?.paidAt &&
+        now - o.payment.paidAt >= ESCROW_DEADLINE_MS
+    );
+    for (const o of due) {
+      const service = Services.byId(o.serviceId);
+      const amount = o.payment.amount;
+      // Flip state first so a concurrent/next sweep won't pick it up again.
+      const updated = Orders.update(o.id, {
+        status: "cancelled",
+        payment: { ...o.payment, status: "refunded" },
+        autoRefund: { at: now, reason: "Not delivered within 24 hours of funding" },
+        history: [...(o.history || []), { status: "cancelled", at: now }],
+      });
+      notify(
+        o.customerId,
+        "payment",
+        `"${service?.title || "Your order"}" wasn't delivered within 24 hours — ${money(amount)} is being refunded to you from escrow.`,
+        o.id
+      );
+      notify(
+        o.providerId,
+        "payment",
+        `"${service?.title || "An order"}" wasn't delivered within 24 hours, so ${money(amount)} was refunded to the customer from escrow.`,
+        o.id
+      );
+      await refundEscrow(updated);
+    }
+  } finally {
+    sweepingEscrow = false;
   }
 }
 
@@ -1410,6 +1470,11 @@ load()
         `CampusConnect API running on http://localhost:${PORT} · storage: ${USING_SUPABASE ? "Supabase" : "local file"} · auth: ${AUTH_ENABLED ? "Supabase Auth" : "DISABLED (set SUPABASE keys)"}`
       );
     });
+    // Refund overdue escrow even when nobody's browsing: sweep now (catch up on
+    // anything that expired while we were down) and then on a steady interval.
+    const sweepEvery = Number(process.env.ESCROW_SWEEP_INTERVAL_MS) || 10 * 60 * 1000;
+    sweepExpiredEscrow().catch((e) => console.error("escrow sweep:", e.message));
+    setInterval(() => sweepExpiredEscrow().catch((e) => console.error("escrow sweep:", e.message)), sweepEvery);
   })
   .catch((e) => {
     console.error("Failed to start — could not load the datastore:\n ", e.message);

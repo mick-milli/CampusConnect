@@ -99,6 +99,10 @@ function PayForm({ order, onUpdate, paystackEnabled }) {
           ? "You'll complete payment securely on Paystack."
           : "Demo: this is a simulated charge, no real money moves."}
       </p>
+      <p className="muted" style={{ fontSize: 12, margin: "6px 0 0" }}>
+        ⚠️ Once you pay, this order can’t be cancelled. If the provider doesn’t deliver within 24
+        hours, your money is automatically refunded to you from escrow.
+      </p>
     </form>
   );
 }
@@ -182,16 +186,23 @@ function PaymentSection({ order, role, onUpdate, paystackEnabled, feeRate }) {
       {pay.status === "in_escrow" && (
         <p className="pay-note muted">
           {role === "provider"
-            ? `✅ ${cedis(pay.amount)} secured in escrow — safe to start. After the ${pct(feeRate)} platform fee (${cedis(fee)}) you'll receive ${cedis(net)} once the customer confirms completion.`
-            : `✅ ${cedis(pay.amount)} held in escrow. Released to the provider when you confirm the work is done.`}
+            ? order.status === "delivered"
+              ? `✅ ${cedis(pay.amount)} held in escrow — you've marked this delivered. After the ${pct(feeRate)} platform fee (${cedis(fee)}) you'll receive ${cedis(net)} once the customer confirms.`
+              : `✅ ${cedis(pay.amount)} secured in escrow — safe to start. After the ${pct(feeRate)} platform fee (${cedis(fee)}) you'll receive ${cedis(net)} once the customer confirms completion. This order can no longer be cancelled — deliver it within 24 hours, or the ${cedis(pay.amount)} is automatically refunded to the customer.`
+            : order.status === "delivered"
+              ? `✅ ${cedis(pay.amount)} held in escrow. The provider has marked this delivered — confirm you received the work to release payment, or flag it if something's wrong.`
+              : `✅ ${cedis(pay.amount)} held in escrow, released to the provider when you confirm the work is done. This order can no longer be cancelled; if the provider doesn't deliver within 24 hours, your money is automatically refunded to you.`}
         </p>
       )}
       {/* Provider terms, shown before/while they work so it's never a surprise. */}
       {role === "provider" && ["unpaid", "in_escrow"].includes(pay.status) && (
         <p className="pay-note muted" style={{ fontSize: 12 }}>
-          ℹ️ Terms: a {pct(feeRate)} platform fee is deducted on completion. If work is left
-          uncompleted, the customer can flag the order — after raising it with you in chat — for a
-          full refund. Keep what you agree in the order chat; it's the record.
+          ℹ️ Terms: a {pct(feeRate)} platform fee is deducted on completion. Once the customer funds
+          escrow the order can’t be cancelled — you must deliver within 24 hours, or the money is
+          automatically refunded to the customer. Once you've delivered, that deadline stops and it's
+          on the customer to confirm. If work is left uncompleted, the customer can also flag the
+          order — after raising it with you in chat — for a full refund. Keep what you agree in the
+          order chat; it's the record.
         </p>
       )}
       {pay.status === "released" &&
@@ -336,12 +347,16 @@ function OrderCard({ order, role, me, onUpdate, onRemove, onReviewed, paystackEn
     }
   };
 
-  // Providers can accept/cancel freely, but can't start *work* on an online
-  // order until escrow is funded (payment happens after acceptance).
+  // Providers can accept/cancel before funding, but can't start *work* on an
+  // online order until escrow is funded (payment happens after acceptance).
+  const funded = order.payment?.status === "in_escrow";
   const escrowBlocked = role === "provider" && isOnline(order.payment) && order.payment?.status === "unpaid";
   let nextSteps = role === "provider" ? PROVIDER_NEXT[order.status] || [] : [];
   if (escrowBlocked) nextSteps = nextSteps.filter((s) => !WORK_STEPS.includes(s));
-  const customerCanCancel = role === "customer" && ["requested", "accepted"].includes(order.status);
+  // Once money is in escrow the order is locked in — neither party can cancel it.
+  if (funded) nextSteps = nextSteps.filter((s) => s !== "cancelled");
+  const customerCanCancel =
+    role === "customer" && ["requested", "accepted"].includes(order.status) && !funded;
   const customerCanComplete = role === "customer" && order.status === "delivered";
   // The server decides whether/why the customer can flag right now: "eligible"
   // shows the button; "raise"/"wait" show a nudge to talk to the provider first.

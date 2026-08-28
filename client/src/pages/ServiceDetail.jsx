@@ -160,6 +160,8 @@ export default function ServiceDetail() {
               <p className="muted" style={{ fontSize: 13, marginTop: 8 }}>
                 🔒 You'll pay after the provider accepts. Funds are held in
                 escrow and released to them only once you confirm the work is done.
+                Once you've paid, the order can't be cancelled — but if the provider
+                doesn't deliver within 24 hours, your money is automatically refunded to you.
               </p>
 
               <button className="btn" style={{ width: "100%", marginTop: 18 }} disabled={submitting}>
